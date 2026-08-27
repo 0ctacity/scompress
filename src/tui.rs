@@ -201,13 +201,7 @@ impl App {
                     },
                 );
             }
-            ProgressEvent::Completed {
-                path,
-                op,
-                success,
-                error: _,
-            } => {
-                // Update file info directly in tool_groups
+            ProgressEvent::Completed { path, op, success } => {
                 let (compressed, logical_size, physical_size) = inspect_file(&path);
                 for tg in &mut self.tool_groups {
                     for pg in &mut tg.projects {
@@ -223,7 +217,6 @@ impl App {
                 self.row_ops
                     .insert(path, ActiveOp::Finished { op, success });
 
-                // Check if all active operations finished
                 let still_running = self.row_ops.values().any(|op_state| match op_state {
                     ActiveOp::Queued { .. } | ActiveOp::Running { .. } => true,
                     ActiveOp::Finished { .. } => false,
@@ -527,15 +520,13 @@ impl App {
                                 path: s.path,
                                 op,
                                 success: true,
-                                error: None,
                             });
                         }
-                        Err(reason) => {
+                        Err(_) => {
                             let _ = tx.try_send(ProgressEvent::Completed {
                                 path: s.path,
                                 op,
                                 success: false,
-                                error: Some(reason.to_string()),
                             });
                         }
                     },
@@ -545,7 +536,6 @@ impl App {
                                 path: s.path,
                                 op,
                                 success: true,
-                                error: None,
                             });
                         } else {
                             let _ = decompress_sync_with_progress(&s.path, tx.clone());
@@ -596,7 +586,6 @@ async fn run_app_loop(
     let mut last_tick = Instant::now();
 
     loop {
-        // Drain any incoming progress events
         while let Ok(event) = app.progress_rx.try_recv() {
             app.handle_progress_event(event);
         }
@@ -607,53 +596,53 @@ async fn run_app_loop(
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    return Ok(());
-                }
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
 
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Esc => {
-                        if !app.selected_sessions.is_empty() {
-                            app.clear_selection();
-                        } else {
-                            return Ok(());
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        app.toggle_select_current();
-                    }
-                    KeyCode::Char('S') => {
-                        app.select_range_to_current();
-                    }
-                    KeyCode::Char('x') => {
+            match key.code {
+                KeyCode::Char('q') => return Ok(()),
+                KeyCode::Esc => {
+                    if !app.selected_sessions.is_empty() {
                         app.clear_selection();
+                    } else {
+                        return Ok(());
                     }
-                    KeyCode::Char('r') => {
-                        app.refresh().await?;
-                    }
-                    KeyCode::Char('c') => {
-                        app.start_batch_operation(OpType::Compressing);
-                    }
-                    KeyCode::Char('d') => {
-                        app.start_batch_operation(OpType::Decompressing);
-                    }
-                    KeyCode::Char(' ') | KeyCode::Enter => {
-                        app.toggle_current_expand();
-                    }
-                    KeyCode::Char('e') | KeyCode::Tab => {
-                        app.toggle_expand_all();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.next();
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.previous();
-                    }
-                    _ => {}
                 }
+                KeyCode::Char('s') => {
+                    app.toggle_select_current();
+                }
+                KeyCode::Char('S') => {
+                    app.select_range_to_current();
+                }
+                KeyCode::Char('x') => {
+                    app.clear_selection();
+                }
+                KeyCode::Char('r') => {
+                    app.refresh().await?;
+                }
+                KeyCode::Char('c') => {
+                    app.start_batch_operation(OpType::Compressing);
+                }
+                KeyCode::Char('d') => {
+                    app.start_batch_operation(OpType::Decompressing);
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    app.toggle_current_expand();
+                }
+                KeyCode::Char('e') | KeyCode::Tab => {
+                    app.toggle_expand_all();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.next();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.previous();
+                }
+                _ => {}
             }
         }
 
@@ -677,9 +666,9 @@ fn ui(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Summary Stats
-            Constraint::Min(5),    // Hierarchical expandable session tree
-            Constraint::Length(3), // Footer & Status
+            Constraint::Length(7),
+            Constraint::Min(5),
+            Constraint::Length(3),
         ])
         .split(inner_area);
 
@@ -956,7 +945,6 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     Span::raw("  "),
                 ];
 
-                // Check if this row has an active progress/op
                 if let Some(op_state) = app.row_ops.get(&session.path) {
                     match op_state {
                         ActiveOp::Running {
@@ -1185,7 +1173,7 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::{SessionFile, Tool};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     fn sample_app() -> App {
@@ -1236,17 +1224,14 @@ mod tests {
             .visible_items
             .iter()
             .position(|item| match item {
-                TreeItem::SessionItem { session } => session.path == PathBuf::from("/tmp/a1.jsonl"),
+                TreeItem::SessionItem { session } => session.path == Path::new("/tmp/a1.jsonl"),
                 _ => false,
             })
             .expect("Session A1 not found in visible items");
 
         app.selected_index = a1_idx;
         app.toggle_select_current();
-        assert!(
-            app.selected_sessions
-                .contains(&PathBuf::from("/tmp/a1.jsonl"))
-        );
+        assert!(app.selected_sessions.contains(Path::new("/tmp/a1.jsonl")));
         assert_eq!(app.selected_sessions.len(), 1);
 
         app.clear_selection();
@@ -1268,17 +1253,10 @@ mod tests {
         app.selected_index = proj_a_idx;
         app.toggle_select_current();
 
-        assert!(
-            app.selected_sessions
-                .contains(&PathBuf::from("/tmp/a1.jsonl"))
-        );
-        assert!(
-            app.selected_sessions
-                .contains(&PathBuf::from("/tmp/a2.jsonl"))
-        );
+        assert!(app.selected_sessions.contains(Path::new("/tmp/a1.jsonl")));
+        assert!(app.selected_sessions.contains(Path::new("/tmp/a2.jsonl")));
         assert_eq!(app.selected_sessions.len(), 2);
 
-        // Toggle again to deselect
         app.toggle_select_current();
         assert!(app.selected_sessions.is_empty());
     }
@@ -1290,7 +1268,7 @@ mod tests {
             .visible_items
             .iter()
             .position(|item| match item {
-                TreeItem::SessionItem { session } => session.path == PathBuf::from("/tmp/a1.jsonl"),
+                TreeItem::SessionItem { session } => session.path == Path::new("/tmp/a1.jsonl"),
                 _ => false,
             })
             .unwrap();
@@ -1299,7 +1277,7 @@ mod tests {
             .visible_items
             .iter()
             .position(|item| match item {
-                TreeItem::SessionItem { session } => session.path == PathBuf::from("/tmp/b1.jsonl"),
+                TreeItem::SessionItem { session } => session.path == Path::new("/tmp/b1.jsonl"),
                 _ => false,
             })
             .unwrap();
@@ -1310,14 +1288,8 @@ mod tests {
         app.selected_index = b1_idx;
         app.select_range_to_current();
 
-        assert!(
-            app.selected_sessions
-                .contains(&PathBuf::from("/tmp/a1.jsonl"))
-        );
-        assert!(
-            app.selected_sessions
-                .contains(&PathBuf::from("/tmp/b1.jsonl"))
-        );
+        assert!(app.selected_sessions.contains(Path::new("/tmp/a1.jsonl")));
+        assert!(app.selected_sessions.contains(Path::new("/tmp/b1.jsonl")));
     }
 
     #[test]

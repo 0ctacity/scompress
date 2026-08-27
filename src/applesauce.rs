@@ -40,17 +40,7 @@ pub enum ProgressEvent {
         path: PathBuf,
         op: OpType,
         success: bool,
-        error: Option<String>,
     },
-}
-
-impl ProgressEvent {
-    pub fn error_message(&self) -> Option<&str> {
-        match self {
-            ProgressEvent::Completed { error, .. } => error.as_deref(),
-            _ => None,
-        }
-    }
 }
 
 struct SilentProgress;
@@ -90,12 +80,11 @@ impl Task for ChannelTask {
         });
     }
 
-    fn error(&self, message: &str) {
+    fn error(&self, _message: &str) {
         let _ = self.sender.try_send(ProgressEvent::Completed {
             path: self.path.clone(),
             op: self.op,
             success: false,
-            error: Some(message.to_string()),
         });
     }
 }
@@ -108,21 +97,19 @@ struct ChannelProgress {
 impl Progress for ChannelProgress {
     type Task = ChannelTask;
 
-    fn error(&self, path: &Path, message: &str) {
+    fn error(&self, path: &Path, _message: &str) {
         let _ = self.sender.try_send(ProgressEvent::Completed {
             path: path.to_path_buf(),
             op: self.op,
             success: false,
-            error: Some(message.to_string()),
         });
     }
 
-    fn file_skipped(&self, path: &Path, why: SkipReason) {
+    fn file_skipped(&self, path: &Path, _why: SkipReason) {
         let _ = self.sender.try_send(ProgressEvent::Completed {
             path: path.to_path_buf(),
             op: self.op,
             success: false,
-            error: Some(format!("Skipped: {:?}", why)),
         });
     }
 
@@ -169,7 +156,6 @@ pub fn compress_sync_with_progress(
         path: path.to_path_buf(),
         op: OpType::Compressing,
         success: true,
-        error: None,
     });
     Ok(())
 }
@@ -194,7 +180,6 @@ pub fn decompress_sync_with_progress(
         path: path.to_path_buf(),
         op: OpType::Decompressing,
         success: true,
-        error: None,
     });
     Ok(())
 }
@@ -284,7 +269,6 @@ mod tests {
 
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            let _ = ev.error_message();
             events.push(ev);
         }
 
