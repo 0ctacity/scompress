@@ -14,7 +14,7 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table},
@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Debug)]
 pub enum TreeItem {
@@ -56,6 +57,20 @@ pub enum ActiveOp {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchStatus {
+    Idle,
+    Running {
+        op: OpType,
+        completed: usize,
+        total: usize,
+    },
+    Finished {
+        op: OpType,
+        total: usize,
+    },
+}
+
 pub struct App {
     pub tool_groups: Vec<ToolGroup>,
     pub collapsed_tools: HashSet<Tool>,
@@ -66,6 +81,7 @@ pub struct App {
     pub selected_index: usize,
     pub status_message: String,
     pub is_busy: bool,
+    pub batch_status: BatchStatus,
     pub row_ops: HashMap<PathBuf, ActiveOp>,
     pub progress_tx: smol::channel::Sender<ProgressEvent>,
     pub progress_rx: smol::channel::Receiver<ProgressEvent>,
@@ -86,6 +102,7 @@ impl App {
             selected_index: 0,
             status_message: "s: Select | S: Range select | o: Sort | c: Compress | d: Decompress | Space: Toggle node | r: Refresh".to_string(),
             is_busy: false,
+            batch_status: BatchStatus::Idle,
             row_ops: HashMap::new(),
             progress_tx: tx,
             progress_rx: rx,
@@ -296,6 +313,10 @@ impl App {
                 self.row_ops
                     .insert(path, ActiveOp::Finished { op, success });
 
+                if let BatchStatus::Running { completed, .. } = &mut self.batch_status {
+                    *completed += 1;
+                }
+
                 let still_running = self.row_ops.values().any(|op_state| match op_state {
                     ActiveOp::Queued { .. } | ActiveOp::Running { .. } => true,
                     ActiveOp::Finished { .. } => false,
@@ -304,6 +325,7 @@ impl App {
                 if !still_running && self.is_busy {
                     self.is_busy = false;
                     let count = self.row_ops.len();
+                    self.batch_status = BatchStatus::Finished { op, total: count };
                     self.status_message = format!(
                         "Finished processing {} session{}",
                         count,
@@ -566,7 +588,13 @@ impl App {
             return;
         }
 
+        let total = targets.len();
         self.is_busy = true;
+        self.batch_status = BatchStatus::Running {
+            op,
+            completed: 0,
+            total,
+        };
         self.status_message = format!("Starting {} for {}...", op, target_label);
         self.row_ops.clear();
 
@@ -738,10 +766,56 @@ async fn run_app_loop(
 fn ui(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    let main_block = Block::default()
+    let mut main_block = Block::default()
         .borders(Borders::ALL)
         .title(" scompress ")
         .style(Style::default().fg(Color::Cyan));
+
+    match &app.batch_status {
+        BatchStatus::Running {
+            op,
+            completed,
+            total,
+        } => {
+            let current = (*completed + 1).min(*total);
+            let op_name = match op {
+                OpType::Compressing => "Compressing",
+                OpType::Decompressing => "Decompressing",
+            };
+            let title_text = format!(" {} {}/{} ", op_name, current, total);
+            main_block = main_block.title_top(
+                Line::from(Span::styled(
+                    title_text,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
+            );
+        }
+        BatchStatus::Finished { op, total } => {
+            let action_name = match op {
+                OpType::Compressing => "Compressed",
+                OpType::Decompressing => "Decompressed",
+            };
+            let title_text = format!(
+                " {} {} session{} ",
+                action_name,
+                total,
+                if *total == 1 { "" } else { "s" }
+            );
+            main_block = main_block.title_top(
+                Line::from(Span::styled(
+                    title_text,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
+            );
+        }
+        BatchStatus::Idle => {}
+    }
 
     let inner_area = main_block.inner(size);
     f.render_widget(main_block, size);
@@ -1275,8 +1349,18 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() > max_len {
-        let mut res: String = s.chars().take(max_len.saturating_sub(3)).collect();
+    if s.width() > max_len {
+        let mut width = 0;
+        let mut res = String::new();
+        let target_len = max_len.saturating_sub(3);
+        for c in s.chars() {
+            let cw = c.width().unwrap_or(0);
+            if width + cw > target_len {
+                break;
+            }
+            width += cw;
+            res.push(c);
+        }
         res.push_str("...");
         res
     } else {
@@ -1290,6 +1374,13 @@ mod tests {
     use crate::model::{SessionFile, SortDirection, SortField, Tool};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn test_truncate_str_ascii_and_unicode() {
+        assert_eq!(truncate_str("Hello World", 20), "Hello World");
+        assert_eq!(truncate_str("Hello World", 8), "Hello...");
+        assert_eq!(truncate_str("こんにちは世界", 8), "こん...");
+    }
 
     fn sample_app() -> App {
         let mut app = App::new();
@@ -1503,9 +1594,16 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_progress_events() {
+    fn test_handle_progress_events_and_batch_status() {
         let mut app = sample_app();
         let test_path = PathBuf::from("/tmp/a1.jsonl");
+
+        app.batch_status = BatchStatus::Running {
+            op: OpType::Compressing,
+            completed: 0,
+            total: 2,
+        };
+        app.is_busy = true;
 
         app.handle_progress_event(ProgressEvent::Started {
             path: test_path.clone(),
@@ -1539,5 +1637,20 @@ mod tests {
             }
             _ => panic!("Expected Running state with updated bytes"),
         }
+
+        app.handle_progress_event(ProgressEvent::Completed {
+            path: test_path.clone(),
+            op: OpType::Compressing,
+            success: true,
+        });
+
+        assert_eq!(
+            app.batch_status,
+            BatchStatus::Finished {
+                op: OpType::Compressing,
+                total: 1
+            }
+        );
+        assert!(!app.is_busy);
     }
 }
