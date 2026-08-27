@@ -9,7 +9,10 @@ Compressed session files remain fully readable by Codex and Claude without patch
 ## Features
 
 - **Transparent Filesystem Compression**: Uses native macOS kernel-level `decmpfs` compression (LZFSE algorithm) powered by [`applesauce`](https://crates.io/crates/applesauce).
-- **Interactive TUI**: Built with [Ratatui](https://ratatui.rs) and [smol](https://github.com/smol-rs/smol) for browsing session storage savings in real time.
+- **Hierarchical Project & Session Tree**: Groups sessions by `Tool → Project → Thread` with real thread names indexed from `~/.codex/session_index.jsonl`.
+- **Interactive TUI with Selection Mode**: Built with [Ratatui](https://ratatui.rs) and [smol](https://github.com/smol-rs/smol).
+  - Select individual nodes with `s` or ranges with `Shift + S`.
+  - Batch compress or decompress selected items with `c` and `d`.
 - **Safety First**:
   - Automatically skips actively open files via batch `lsof` inspection.
   - Skips symlinks and non-regular files.
@@ -52,27 +55,35 @@ scompress
 ```
 
 ```text
-┌─ scompress ─────────────────────────────────────────┐
-│ Tool      Files     Logical      Disk      Saved   │
-│ Codex       142      3.8 GB     240 MB     3.6 GB │
-│ Claude       61      1.4 GB      96 MB     1.3 GB │
-├────────────────────────────────────────────────────┤
-│ > Codex   rollout-2026-07-06...  ● normal   35.5 MB  │
-│   Claude  project-xyz.jsonl      ◉ compressed 91 MB → 4 MB │
-│                                                    │
-│ c Compress   d Decompress   r Refresh   q Quit     │
-└────────────────────────────────────────────────────┘
+┌─ scompress ──────────────────────────────────────────┐
+│ Tool      Files     Logical      Disk      Saved     │
+│ Codex       229      6.4 GB    2.1 GB     4.3 GB     │
+│ Claude       61      1.4 GB     96 MB     1.3 GB     │
+├──────────────────────────────────────────────────────┤
+│ ▼ Codex (229 files, 6.4 GB → 2.1 GB, Saved 4.3 GB)   │
+│   ▼ scompress (12 sessions, 450 MB → 30 MB)          │
+│       [✓] Fix session tree rendering  ◉ compressed   │
+│       [✓] Add Applesauce backend      ◉ compressed   │
+│   ▶ rchat (35 sessions, 850 MB → 210 MB)             │
+│                                                      │
+│ s Select  S Range  Space Toggle  c Compress  q Quit  │
+└──────────────────────────────────────────────────────┘
 ```
 
-#### Keybindings
+#### TUI Keybindings
 
 | Key | Action |
 | --- | --- |
-| `c` | Compress all eligible session files |
-| `d` | Decompress all compressed session files |
+| `s` | Toggle selection for highlighted node (Session / Project / Tool) |
+| `S` (`Shift + S`) | Select range from anchor to cursor |
+| `Esc` / `x` | Clear selection |
+| `Space` / `Enter` | Expand / collapse highlighted project or tool node |
+| `e` / `Tab` | Expand / collapse all nodes |
+| `c` | Compress selection (or highlighted node if no selection) |
+| `d` | Decompress selection (or highlighted node if no selection) |
 | `r` | Rescan / refresh session list |
-| `↑` / `k`, `↓` / `j` | Browse sessions list |
-| `q` / `Esc` | Quit |
+| `↑` / `k`, `↓` / `j` | Navigate up / down |
+| `q` | Quit |
 
 ---
 
@@ -80,7 +91,7 @@ scompress
 
 #### 1. List Sessions
 
-List discovered session files, physical disk usage, and compression states:
+List discovered session files grouped by project with compression states:
 
 ```bash
 # List all sessions
@@ -139,11 +150,11 @@ cargo nextest run
 src/
 ├── main.rs        # CLI routing & async entrypoint
 ├── cli.rs         # Clap command definitions & CLI handlers
-├── tui.rs         # Ratatui TUI rendering and event loop
-├── scanner.rs     # Codex & Claude session discovery
+├── tui.rs         # Ratatui TUI rendering, selection mode & tree event loop
+├── scanner.rs     # Codex & Claude session discovery & thread metadata
 ├── applesauce.rs  # applesauce crate integration for LZFSE compression
 ├── safety.rs      # lsof process inspection & safety rules
-└── model.rs       # Tool and SessionFile data models
+└── model.rs       # Tool, ProjectGroup, ToolGroup & SessionFile models
 ```
 
 ---
