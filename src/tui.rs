@@ -1,8 +1,8 @@
 use crate::applesauce::{compress, decompress};
 use crate::cli::{format_relative_time, format_size};
-use crate::model::{SessionFile, Tool};
+use crate::model::{SessionFile, Tool, ToolGroup};
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
-use crate::scanner::{claude_projects_dir, codex_sessions_dir, scan_all};
+use crate::scanner::{build_tool_groups, claude_projects_dir, codex_sessions_dir, scan_all};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
@@ -17,27 +17,29 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Stdout, stdout};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug)]
 pub enum TreeItem {
+    ToolHeader {
+        tool: Tool,
+        is_expanded: bool,
+    },
     ProjectHeader {
         tool: Tool,
         project: String,
-        count: usize,
-        logical_size: u64,
-        physical_size: u64,
         is_expanded: bool,
     },
     SessionItem {
-        session_index: usize,
+        session: SessionFile,
     },
 }
 
 pub struct App {
-    pub sessions: Vec<SessionFile>,
+    pub tool_groups: Vec<ToolGroup>,
+    pub collapsed_tools: HashSet<Tool>,
     pub collapsed_projects: HashSet<(Tool, String)>,
     pub visible_items: Vec<TreeItem>,
     pub selected_index: usize,
@@ -48,49 +50,57 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            sessions: Vec::new(),
+            tool_groups: Vec::new(),
+            collapsed_tools: HashSet::new(),
             collapsed_projects: HashSet::new(),
             visible_items: Vec::new(),
             selected_index: 0,
-            status_message: "Press 'Space' to expand/collapse, 'c' to compress, 'd' to decompress, 'r' to refresh".to_string(),
+            status_message: "Space/Enter: toggle node | c: compress selection | d: decompress selection | r: refresh".to_string(),
             is_busy: false,
         }
     }
 
-    pub fn rebuild_visible_items(&mut self) {
-        let mut groups: BTreeMap<(Tool, String), Vec<usize>> = BTreeMap::new();
-        for (idx, s) in self.sessions.iter().enumerate() {
-            groups
-                .entry((s.tool, s.project.clone()))
-                .or_default()
-                .push(idx);
+    pub fn set_sessions(&mut self, sessions: Vec<SessionFile>) {
+        self.tool_groups = build_tool_groups(&sessions);
+        self.rebuild_visible_items();
+    }
+
+    pub fn all_sessions(&self) -> Vec<SessionFile> {
+        let mut list = Vec::new();
+        for tg in &self.tool_groups {
+            for pg in &tg.projects {
+                list.extend(pg.sessions.clone());
+            }
         }
+        list
+    }
 
+    pub fn rebuild_visible_items(&mut self) {
         let mut items = Vec::new();
-        for ((tool, project), session_indices) in groups {
-            let is_expanded = !self.collapsed_projects.contains(&(tool, project.clone()));
-            let count = session_indices.len();
-            let logical_size: u64 = session_indices
-                .iter()
-                .map(|&i| self.sessions[i].logical_size)
-                .sum();
-            let physical_size: u64 = session_indices
-                .iter()
-                .map(|&i| self.sessions[i].physical_size)
-                .sum();
 
-            items.push(TreeItem::ProjectHeader {
-                tool,
-                project: project.clone(),
-                count,
-                logical_size,
-                physical_size,
-                is_expanded,
+        for tg in &self.tool_groups {
+            let is_tool_expanded = !self.collapsed_tools.contains(&tg.tool);
+            items.push(TreeItem::ToolHeader {
+                tool: tg.tool,
+                is_expanded: is_tool_expanded,
             });
 
-            if is_expanded {
-                for idx in session_indices {
-                    items.push(TreeItem::SessionItem { session_index: idx });
+            if is_tool_expanded {
+                for pg in &tg.projects {
+                    let is_proj_expanded = !self
+                        .collapsed_projects
+                        .contains(&(tg.tool, pg.name.clone()));
+                    items.push(TreeItem::ProjectHeader {
+                        tool: tg.tool,
+                        project: pg.name.clone(),
+                        is_expanded: is_proj_expanded,
+                    });
+
+                    if is_proj_expanded {
+                        for s in &pg.sessions {
+                            items.push(TreeItem::SessionItem { session: s.clone() });
+                        }
+                    }
                 }
             }
         }
@@ -106,9 +116,13 @@ impl App {
         self.status_message = "Scanning session files...".to_string();
         match scan_all().await {
             Ok(sessions) => {
-                self.sessions = sessions;
-                self.rebuild_visible_items();
-                self.status_message = format!("Discovered {} session files", self.sessions.len());
+                let count = sessions.len();
+                self.set_sessions(sessions);
+                self.status_message = format!(
+                    "Discovered {} sessions across {} tools",
+                    count,
+                    self.tool_groups.len()
+                );
             }
             Err(e) => {
                 self.status_message = format!("Scan error: {}", e);
@@ -124,6 +138,14 @@ impl App {
         }
 
         match &self.visible_items[self.selected_index] {
+            TreeItem::ToolHeader { tool, .. } => {
+                if self.collapsed_tools.contains(tool) {
+                    self.collapsed_tools.remove(tool);
+                } else {
+                    self.collapsed_tools.insert(*tool);
+                }
+                self.rebuild_visible_items();
+            }
             TreeItem::ProjectHeader { tool, project, .. } => {
                 let key = (*tool, project.clone());
                 if self.collapsed_projects.contains(&key) {
@@ -133,9 +155,9 @@ impl App {
                 }
                 self.rebuild_visible_items();
             }
-            TreeItem::SessionItem { session_index } => {
-                let s = &self.sessions[*session_index];
-                let key = (s.tool, s.project.clone());
+            TreeItem::SessionItem { session } => {
+                // Collapse the parent project
+                let key = (session.tool, session.project.clone());
                 self.collapsed_projects.insert(key);
                 self.rebuild_visible_items();
             }
@@ -143,23 +165,71 @@ impl App {
     }
 
     pub fn toggle_expand_all(&mut self) {
-        if self.collapsed_projects.is_empty() {
-            // Collapse all
-            for s in &self.sessions {
-                self.collapsed_projects.insert((s.tool, s.project.clone()));
+        if self.collapsed_tools.is_empty() && self.collapsed_projects.is_empty() {
+            // Collapse everything
+            for tg in &self.tool_groups {
+                self.collapsed_tools.insert(tg.tool);
+                for pg in &tg.projects {
+                    self.collapsed_projects.insert((tg.tool, pg.name.clone()));
+                }
             }
         } else {
             // Expand all
+            self.collapsed_tools.clear();
             self.collapsed_projects.clear();
         }
         self.rebuild_visible_items();
     }
 
-    pub async fn compress_all(&mut self) -> Result<()> {
+    /// Determine target sessions based on the currently selected tree item.
+    pub fn selected_target_sessions(&self) -> (String, Vec<SessionFile>) {
+        if self.visible_items.is_empty() {
+            return ("all".to_string(), self.all_sessions());
+        }
+
+        match &self.visible_items[self.selected_index] {
+            TreeItem::ToolHeader { tool, .. } => {
+                let sessions: Vec<SessionFile> = self
+                    .tool_groups
+                    .iter()
+                    .filter(|tg| tg.tool == *tool)
+                    .flat_map(|tg| tg.projects.iter().flat_map(|pg| pg.sessions.clone()))
+                    .collect();
+                (format!("{} ({} sessions)", tool, sessions.len()), sessions)
+            }
+            TreeItem::ProjectHeader { tool, project, .. } => {
+                let sessions: Vec<SessionFile> = self
+                    .tool_groups
+                    .iter()
+                    .filter(|tg| tg.tool == *tool)
+                    .flat_map(|tg| tg.projects.iter())
+                    .filter(|pg| pg.name == *project)
+                    .flat_map(|pg| pg.sessions.clone())
+                    .collect();
+                (
+                    format!("{}/{} ({} sessions)", tool, project, sessions.len()),
+                    sessions,
+                )
+            }
+            TreeItem::SessionItem { session } => (
+                format!("session '{}'", session.label()),
+                vec![session.clone()],
+            ),
+        }
+    }
+
+    pub async fn compress_selected(&mut self) -> Result<()> {
         if self.is_busy {
             return Ok(());
         }
+        let (target_label, targets) = self.selected_target_sessions();
+        if targets.is_empty() {
+            self.status_message = "No sessions to compress".to_string();
+            return Ok(());
+        }
+
         self.is_busy = true;
+        self.status_message = format!("Compressing {}...", target_label);
 
         let mut roots = Vec::new();
         if let Some(d) = codex_sessions_dir() {
@@ -176,7 +246,7 @@ impl App {
         let mut skipped = 0;
         let mut failed = 0;
 
-        for s in &self.sessions {
+        for s in &targets {
             match check_compression_safety(s, &open_files, now) {
                 Ok(()) => match compress(&s.path).await {
                     Ok(()) => compressed += 1,
@@ -191,31 +261,36 @@ impl App {
             }
         }
 
-        // Refresh after compressing
         if let Ok(sessions) = scan_all().await {
-            self.sessions = sessions;
-            self.rebuild_visible_items();
+            self.set_sessions(sessions);
         }
 
         self.status_message = format!(
-            "Compression complete: {} compressed, {} skipped, {} failed",
-            compressed, skipped, failed
+            "Compressed {}: {} ok, {} skipped, {} failed",
+            target_label, compressed, skipped, failed
         );
         self.is_busy = false;
         Ok(())
     }
 
-    pub async fn decompress_all(&mut self) -> Result<()> {
+    pub async fn decompress_selected(&mut self) -> Result<()> {
         if self.is_busy {
             return Ok(());
         }
+        let (target_label, targets) = self.selected_target_sessions();
+        if targets.is_empty() {
+            self.status_message = "No sessions to decompress".to_string();
+            return Ok(());
+        }
+
         self.is_busy = true;
+        self.status_message = format!("Decompressing {}...", target_label);
 
         let mut decompressed = 0;
         let mut skipped = 0;
         let mut failed = 0;
 
-        for s in &self.sessions {
+        for s in &targets {
             if !s.compressed {
                 skipped += 1;
                 continue;
@@ -227,15 +302,13 @@ impl App {
             }
         }
 
-        // Refresh after decompressing
         if let Ok(sessions) = scan_all().await {
-            self.sessions = sessions;
-            self.rebuild_visible_items();
+            self.set_sessions(sessions);
         }
 
         self.status_message = format!(
-            "Decompression complete: {} decompressed, {} skipped, {} failed",
-            decompressed, skipped, failed
+            "Decompressed {}: {} ok, {} skipped, {} failed",
+            target_label, decompressed, skipped, failed
         );
         self.is_busy = false;
         Ok(())
@@ -299,10 +372,10 @@ async fn run_app_loop(
                         app.refresh().await?;
                     }
                     KeyCode::Char('c') => {
-                        app.compress_all().await?;
+                        app.compress_selected().await?;
                     }
                     KeyCode::Char('d') => {
-                        app.decompress_all().await?;
+                        app.decompress_selected().await?;
                     }
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         app.toggle_current_expand();
@@ -342,7 +415,7 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7), // Summary Stats
-            Constraint::Min(5),    // Hierarchical session tree list
+            Constraint::Min(5),    // Hierarchical expandable session tree
             Constraint::Length(3), // Footer & Status
         ])
         .split(inner_area);
@@ -353,58 +426,32 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_summary(f: &mut Frame, area: Rect, app: &App) {
-    let mut codex_count = 0;
-    let mut codex_logical = 0;
-    let mut codex_physical = 0;
+    let mut rows = Vec::new();
 
-    let mut claude_count = 0;
-    let mut claude_logical = 0;
-    let mut claude_physical = 0;
+    for tg in &app.tool_groups {
+        let count_str = tg.file_count().to_string();
+        let log_str = format_size(tg.logical_size());
+        let phy_str = format_size(tg.physical_size());
+        let sav_str = format_size(tg.saved_size());
 
-    for s in &app.sessions {
-        match s.tool {
-            Tool::Codex => {
-                codex_count += 1;
-                codex_logical += s.logical_size;
-                codex_physical += s.physical_size;
-            }
-            Tool::Claude => {
-                claude_count += 1;
-                claude_logical += s.logical_size;
-                claude_physical += s.physical_size;
-            }
-        }
+        rows.push(Row::new(vec![
+            tg.tool.to_string(),
+            count_str,
+            log_str,
+            phy_str,
+            sav_str,
+        ]));
     }
 
-    let codex_saved = codex_logical.saturating_sub(codex_physical);
-    let claude_saved = claude_logical.saturating_sub(claude_physical);
-
-    let codex_count_str = codex_count.to_string();
-    let codex_logical_str = format_size(codex_logical);
-    let codex_physical_str = format_size(codex_physical);
-    let codex_saved_str = format_size(codex_saved);
-
-    let claude_count_str = claude_count.to_string();
-    let claude_logical_str = format_size(claude_logical);
-    let claude_physical_str = format_size(claude_physical);
-    let claude_saved_str = format_size(claude_saved);
-
-    let rows = vec![
-        Row::new(vec![
-            "Codex",
-            &codex_count_str,
-            &codex_logical_str,
-            &codex_physical_str,
-            &codex_saved_str,
-        ]),
-        Row::new(vec![
-            "Claude",
-            &claude_count_str,
-            &claude_logical_str,
-            &claude_physical_str,
-            &claude_saved_str,
-        ]),
-    ];
+    if rows.is_empty() {
+        rows.push(Row::new(vec![
+            "No sessions".to_string(),
+            "0".to_string(),
+            "0 B".to_string(),
+            "0 B".to_string(),
+            "0 B".to_string(),
+        ]));
+    }
 
     let header = Row::new(vec!["Tool", "Files", "Logical", "Disk", "Saved"]).style(
         Style::default()
@@ -438,13 +485,14 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Determine scrolling window
     let visible_rows = area.height as usize;
     let start_index = if app.selected_index >= visible_rows {
         app.selected_index - visible_rows + 1
     } else {
         0
     };
+
+    let total_width = area.width as usize;
 
     let mut lines = Vec::new();
     for (i, item) in app
@@ -462,27 +510,25 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
         };
 
         match item {
-            TreeItem::ProjectHeader {
-                tool,
-                project,
-                count,
-                logical_size,
-                physical_size,
-                is_expanded,
-            } => {
+            TreeItem::ToolHeader { tool, is_expanded } => {
                 let arrow = if *is_expanded { "▼ " } else { "▶ " };
                 let prefix = if is_selected { "> " } else { "  " };
 
-                let saved = logical_size.saturating_sub(*physical_size);
-                let info_str = format!(
-                    "({} sessions, {} → {}, Saved {})",
-                    count,
-                    format_size(*logical_size),
-                    format_size(*physical_size),
-                    format_size(saved)
-                );
+                // Find tool group stats
+                let tg_opt = app.tool_groups.iter().find(|g| g.tool == *tool);
+                let info_str = if let Some(tg) = tg_opt {
+                    format!(
+                        " ({} files, {} → {}, Saved {})",
+                        tg.file_count(),
+                        format_size(tg.logical_size()),
+                        format_size(tg.physical_size()),
+                        format_size(tg.saved_size())
+                    )
+                } else {
+                    "".to_string()
+                };
 
-                let line_spans = vec![
+                let spans = vec![
                     Span::raw(prefix),
                     Span::styled(
                         arrow,
@@ -491,26 +537,77 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{}/{} ", tool, project),
+                        tool.to_string(),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(info_str, Style::default().fg(Color::DarkGray)),
                 ];
-                lines.push(Line::from(line_spans).style(line_style));
+                lines.push(Line::from(spans).style(line_style));
             }
-            TreeItem::SessionItem { session_index } => {
-                let session = &app.sessions[*session_index];
+            TreeItem::ProjectHeader {
+                tool,
+                project,
+                is_expanded,
+            } => {
+                let arrow = if *is_expanded { "▼ " } else { "▶ " };
                 let prefix = if is_selected { "  > " } else { "    " };
 
+                let pg_opt = app
+                    .tool_groups
+                    .iter()
+                    .find(|g| g.tool == *tool)
+                    .and_then(|tg| tg.projects.iter().find(|p| p.name == *project));
+
+                let info_str = if let Some(pg) = pg_opt {
+                    format!(
+                        " ({} sessions, {} → {}, Saved {})",
+                        pg.sessions.len(),
+                        format_size(pg.logical_size()),
+                        format_size(pg.physical_size()),
+                        format_size(pg.saved_size())
+                    )
+                } else {
+                    "".to_string()
+                };
+
+                let spans = vec![
+                    Span::raw(prefix),
+                    Span::styled(
+                        arrow,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        project.clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(info_str, Style::default().fg(Color::DarkGray)),
+                ];
+                lines.push(Line::from(spans).style(line_style));
+            }
+            TreeItem::SessionItem { session } => {
+                let prefix = if is_selected { "    > " } else { "      " };
                 let time_str = format_relative_time(session.modified_at, now);
-                let title = &session.display_title;
+                let label = session.label();
+
+                // Reserve right-side width for status & sizes (around 42 cols)
+                let right_block_len = 42;
+                let left_indent = 6;
+                let available_title_len = total_width
+                    .saturating_sub(right_block_len + left_indent)
+                    .max(20);
+
+                let display_title = truncate_str(label, available_title_len);
 
                 let mut spans = vec![
                     Span::raw(prefix),
                     Span::styled(
-                        format!("{:<34}", truncate_str(title, 34)),
+                        format!("{:<width$}", display_title, width = available_title_len),
                         if is_selected {
                             Style::default()
                                 .fg(Color::White)
@@ -519,7 +616,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                             Style::default().fg(Color::Gray)
                         },
                     ),
-                    Span::raw(" "),
+                    Span::raw("  "),
                 ];
 
                 if session.compressed {
@@ -529,7 +626,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     ));
                     spans.push(Span::styled(
                         format!(
-                            "{:>7} → {:<7}",
+                            "{:>8} → {:<8}",
                             format_size(session.logical_size),
                             format_size(session.physical_size)
                         ),
@@ -542,7 +639,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     ));
                     spans.push(Span::styled(
                         format!(
-                            "{:>7}   {:<12}",
+                            "{:>8}   {:<12}",
                             format_size(session.logical_size),
                             time_str
                         ),
@@ -567,35 +664,35 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Toggle   "),
+        Span::raw("Toggle  "),
         Span::styled(
-            "e ",
+            "e/Tab ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Toggle All   "),
+        Span::raw("Toggle All  "),
         Span::styled(
             "c ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Compress   "),
+        Span::raw("Compress Node  "),
         Span::styled(
             "d ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Decompress   "),
+        Span::raw("Decompress Node  "),
         Span::styled(
             "r ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("Refresh   "),
+        Span::raw("Refresh  "),
         Span::styled(
             "q ",
             Style::default()

@@ -1,10 +1,11 @@
 use crate::applesauce::{compress, decompress};
-use crate::model::{SessionFile, Tool};
+use crate::model::Tool;
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
-use crate::scanner::{claude_projects_dir, codex_sessions_dir, scan_all, scan_claude, scan_codex};
+use crate::scanner::{
+    build_tool_groups, claude_projects_dir, codex_sessions_dir, scan_all, scan_claude, scan_codex,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 #[derive(Parser, Debug)]
@@ -101,30 +102,7 @@ pub async fn run_list(tool_filter: Option<Tool>) -> Result<()> {
     }
 
     let now = SystemTime::now();
-
-    // Summary stats
-    let mut codex_count = 0;
-    let mut codex_logical = 0;
-    let mut codex_physical = 0;
-
-    let mut claude_count = 0;
-    let mut claude_logical = 0;
-    let mut claude_physical = 0;
-
-    for s in &sessions {
-        match s.tool {
-            Tool::Codex => {
-                codex_count += 1;
-                codex_logical += s.logical_size;
-                codex_physical += s.physical_size;
-            }
-            Tool::Claude => {
-                claude_count += 1;
-                claude_logical += s.logical_size;
-                claude_physical += s.physical_size;
-            }
-        }
-    }
+    let tool_groups = build_tool_groups(&sessions);
 
     println!(
         "{:<8} {:>8} {:>12} {:>12} {:>12}",
@@ -132,72 +110,49 @@ pub async fn run_list(tool_filter: Option<Tool>) -> Result<()> {
     );
     println!("{}", "-".repeat(56));
 
-    if codex_count > 0 || tool_filter == Some(Tool::Codex) {
-        let saved = codex_logical.saturating_sub(codex_physical);
+    for tg in &tool_groups {
         println!(
             "{:<8} {:>8} {:>12} {:>12} {:>12}",
-            "Codex",
-            codex_count,
-            format_size(codex_logical),
-            format_size(codex_physical),
-            format_size(saved)
+            tg.tool.to_string(),
+            tg.file_count(),
+            format_size(tg.logical_size()),
+            format_size(tg.physical_size()),
+            format_size(tg.saved_size())
         );
-    }
-    if claude_count > 0 || tool_filter == Some(Tool::Claude) {
-        let saved = claude_logical.saturating_sub(claude_physical);
-        println!(
-            "{:<8} {:>8} {:>12} {:>12} {:>12}",
-            "Claude",
-            claude_count,
-            format_size(claude_logical),
-            format_size(claude_physical),
-            format_size(saved)
-        );
-    }
-
-    // Group sessions by tool & project
-    let mut groups: BTreeMap<(String, String), Vec<&SessionFile>> = BTreeMap::new();
-    for s in &sessions {
-        groups
-            .entry((s.tool.to_string(), s.project.clone()))
-            .or_default()
-            .push(s);
     }
 
     println!();
-    for ((tool_name, project_name), group_sessions) in groups {
-        let group_logical: u64 = group_sessions.iter().map(|s| s.logical_size).sum();
-        let group_physical: u64 = group_sessions.iter().map(|s| s.physical_size).sum();
-        let group_saved = group_logical.saturating_sub(group_physical);
+    for tg in &tool_groups {
+        println!("▼ {}", tg.tool);
+        for pg in &tg.projects {
+            println!(
+                "  ▼ {} ({} sessions, {} → {}, Saved {})",
+                pg.name,
+                pg.sessions.len(),
+                format_size(pg.logical_size()),
+                format_size(pg.physical_size()),
+                format_size(pg.saved_size())
+            );
 
-        println!(
-            "▼ {} / {} ({} sessions, {} → {}, Saved {})",
-            tool_name,
-            project_name,
-            group_sessions.len(),
-            format_size(group_logical),
-            format_size(group_physical),
-            format_size(group_saved)
-        );
+            for s in &pg.sessions {
+                let time_str = format_relative_time(s.modified_at, now);
+                let label = s.label();
+                let state_str = if s.compressed {
+                    format!(
+                        "◉ compressed {:>8} → {:<8}",
+                        format_size(s.logical_size),
+                        format_size(s.physical_size)
+                    )
+                } else {
+                    format!(
+                        "● normal     {:>8}   {:<12}",
+                        format_size(s.logical_size),
+                        time_str
+                    )
+                };
 
-        for s in group_sessions {
-            let time_str = format_relative_time(s.modified_at, now);
-            let name = &s.display_title;
-            let state_str = if s.compressed {
-                format!(
-                    "◉ compressed {:>8} → {:<8}",
-                    format_size(s.logical_size),
-                    format_size(s.physical_size)
-                )
-            } else {
-                format!(
-                    "● normal     {:>8}   {:<12}",
-                    format_size(s.logical_size),
-                    time_str
-                )
-            };
-
-            println!("    {:<35} {}", name, state_str);
+                println!("      {:<40} {}", label, state_str);
+            }
         }
         println!();
     }
@@ -228,15 +183,15 @@ pub async fn run_compress(tool_filter: Option<Tool>) -> Result<()> {
     let mut failed_count = 0;
 
     for s in sessions {
-        let name = format!("{} / {}", s.project, s.display_title);
+        let name = format!("{} / {} / {}", s.tool, s.project, s.label());
         match check_compression_safety(&s, &open_files, now) {
             Ok(()) => match compress(&s.path).await {
                 Ok(()) => {
-                    println!("✓ {} session {}", s.tool, name);
+                    println!("✓ {}", name);
                     compressed_count += 1;
                 }
                 Err(err) => {
-                    println!("✗ {} session {}: {}", s.tool, name, err);
+                    println!("✗ {}: {}", name, err);
                     failed_count += 1;
                 }
             },
@@ -244,7 +199,7 @@ pub async fn run_compress(tool_filter: Option<Tool>) -> Result<()> {
                 skipped_count += 1;
             }
             Err(reason) => {
-                println!("✗ {} session {}: {}", s.tool, name, reason);
+                println!("✗ {}: {}", name, reason);
                 skipped_count += 1;
             }
         }
@@ -270,7 +225,7 @@ pub async fn run_decompress(tool_filter: Option<Tool>) -> Result<()> {
     let mut failed_count = 0;
 
     for s in sessions {
-        let name = format!("{} / {}", s.project, s.display_title);
+        let name = format!("{} / {} / {}", s.tool, s.project, s.label());
         if !s.compressed {
             skipped_count += 1;
             continue;
@@ -278,11 +233,11 @@ pub async fn run_decompress(tool_filter: Option<Tool>) -> Result<()> {
 
         match decompress(&s.path).await {
             Ok(()) => {
-                println!("✓ {} session {}", s.tool, name);
+                println!("✓ {}", name);
                 decompressed_count += 1;
             }
             Err(err) => {
-                println!("✗ {} session {}: {}", s.tool, name, err);
+                println!("✗ {}: {}", name, err);
                 failed_count += 1;
             }
         }

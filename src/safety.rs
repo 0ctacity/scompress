@@ -123,6 +123,7 @@ mod tests {
         let session = SessionFile {
             tool: Tool::Codex,
             project: "test-proj".to_string(),
+            title: None,
             display_title: "Session 1".to_string(),
             path: PathBuf::from("/tmp/dummy"),
             logical_size: 100,
@@ -147,6 +148,7 @@ mod tests {
         let session = SessionFile {
             tool: Tool::Claude,
             project: "test-proj".to_string(),
+            title: None,
             display_title: "Session 1".to_string(),
             path: file_path.clone(),
             logical_size: 100,
@@ -176,6 +178,7 @@ mod tests {
         let session = SessionFile {
             tool: Tool::Codex,
             project: "test-proj".to_string(),
+            title: None,
             display_title: "Session 1".to_string(),
             path: link_file.clone(),
             logical_size: 100,
@@ -202,6 +205,7 @@ mod tests {
         let session = SessionFile {
             tool: Tool::Codex,
             project: "test-proj".to_string(),
+            title: None,
             display_title: "Session 1".to_string(),
             path: file_path.clone(),
             logical_size: 100,
