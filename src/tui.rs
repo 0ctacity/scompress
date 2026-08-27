@@ -54,6 +54,8 @@ pub enum ActiveOp {
     Finished {
         op: OpType,
         success: bool,
+        logical_size: u64,
+        physical_size: u64,
     },
 }
 
@@ -310,8 +312,24 @@ impl App {
                         }
                     }
                 }
-                self.row_ops
-                    .insert(path, ActiveOp::Finished { op, success });
+                for item in &mut self.visible_items {
+                    if let TreeItem::SessionItem { session } = item
+                        && session.path == path
+                    {
+                        session.compressed = compressed;
+                        session.logical_size = logical_size;
+                        session.physical_size = physical_size;
+                    }
+                }
+                self.row_ops.insert(
+                    path,
+                    ActiveOp::Finished {
+                        op,
+                        success,
+                        logical_size,
+                        physical_size,
+                    },
+                );
 
                 if let BatchStatus::Running { completed, .. } = &mut self.batch_status {
                     *completed += 1;
@@ -1151,7 +1169,12 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                                 Style::default().fg(Color::DarkGray),
                             ));
                         }
-                        ActiveOp::Finished { op, success } => {
+                        ActiveOp::Finished {
+                            op,
+                            success,
+                            logical_size,
+                            physical_size,
+                        } => {
                             if *success {
                                 let action_done = if *op == OpType::Compressing {
                                     "compressed"
@@ -1165,8 +1188,8 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                                 spans.push(Span::styled(
                                     format!(
                                         "{:>8} → {:<8}",
-                                        format_size(session.logical_size),
-                                        format_size(session.physical_size)
+                                        format_size(*logical_size),
+                                        format_size(*physical_size)
                                     ),
                                     Style::default().fg(Color::Green),
                                 ));
@@ -1643,6 +1666,20 @@ mod tests {
             op: OpType::Compressing,
             success: true,
         });
+
+        match app.row_ops.get(&test_path) {
+            Some(ActiveOp::Finished {
+                op,
+                success,
+                logical_size,
+                physical_size,
+            }) => {
+                assert_eq!(*op, OpType::Compressing);
+                assert!(*success);
+                let _ = (*logical_size, *physical_size);
+            }
+            _ => panic!("Expected Finished state"),
+        }
 
         assert_eq!(
             app.batch_status,
