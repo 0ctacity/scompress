@@ -1,46 +1,37 @@
 # scompress
 
-`scompress` is a lightweight macOS utility that transparently compresses **Codex** and **Claude Code** session files using Apple File System Compression (APFS / `decmpfs`) with LZFSE.
+> Compress your long agentic sessions
 
-Compressed session files remain fully readable by Codex and Claude without patches, daemon processes, or session interception. If either tool writes to a compressed session, macOS automatically materializes it back to an uncompressed file; running `scompress c` later compresses it again.
+Transparent, zero-overhead APFS compression tool for **Codex** and **Claude Code** session transcripts.
+
+[![CI](https://github.com/0ctacity/scompress/actions/workflows/ci.yml/badge.svg)](https://github.com/0ctacity/scompress/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+---
+
+## Overview
+
+AI coding agents like **Codex** (`~/.codex/sessions`) and **Claude Code** (`~/.claude/projects`) generate detailed JSONL rollout and transcript histories. Over time, these session logs accumulate into gigabytes of disk space.
+
+`scompress` applies transparent filesystem compression (LZFSE / APFS decmpfs) directly to your agent session files on macOS APFS:
+- **Transparent Reads**: Compressed session files remain fully readable by tools, editors, and background processes without manual decompression.
+- **Safety First**: Automatically detects open files (`lsof`) and recently modified active sessions (< 30s) to prevent race conditions.
+- **Interactive TUI**: Real-time hierarchical browser with multi-session selection, customizable sorting, live progress bars, and batch operations.
 
 ---
 
 ## Features
 
-- **Transparent Filesystem Compression**: Uses native macOS kernel-level `decmpfs` compression (LZFSE algorithm) powered by [`applesauce`](https://crates.io/crates/applesauce).
-- **Hierarchical Project & Session Tree**: Groups sessions by `Tool → Project → Thread` with real thread names indexed from `~/.codex/session_index.jsonl`.
-- **Interactive TUI with Selection Mode**: Built with [Ratatui](https://ratatui.rs) and [smol](https://github.com/smol-rs/smol).
-  - Select individual nodes with `s` or ranges with `Shift + S`.
-  - Batch compress or decompress selected items with `c` and `d`.
-- **Safety First**:
-  - Automatically skips actively open files via batch `lsof` inspection.
-  - Skips symlinks and non-regular files.
-  - Skips files modified very recently (< 30 seconds ago).
-  - Skips already compressed files.
-  - Non-destructive: no files are moved, renamed, or modified in content.
-- **Supported Coding Assistants**:
-  - **Codex**: `~/.codex/sessions/**`
-  - **Claude Code**: `~/.claude/projects/**/*.jsonl`
-
----
-
-## Installation
-
-### Prerequisites
-
-- macOS (APFS or HFS+ with compression support)
-- Rust toolchain (2024 edition / stable)
-
-### Build from Source
-
-```bash
-git clone https://github.com/your-username/scompress.git
-cd scompress
-cargo build --release
-```
-
-The binary will be available at `target/release/scompress`.
+- **Decmpfs APFS Transparent Compression**: High-efficiency LZFSE compression with zero runtime read overhead.
+- **Hierarchical Project & Session Tree**: Grouped by Tool (Codex / Claude) $\to$ Project $\to$ Thread / Session Title.
+- **Multi-Selection Mode**: Select individual sessions (`s`), select ranges (`Shift + S`), or whole project/tool trees for batch compression/decompression.
+- **Flexible Ordering / Sorting (`o`)**:
+  - Ascending / Descending by **Last Modified / Open Date**
+  - Ascending / Descending by **Size**
+  - Ascending / Descending by **Project / Thread Name**
+  - Hierarchical override: Tool-level sort orders apply across all projects and threads under that tool.
+- **Live Per-Row Progress Bars**: Incremental byte-by-byte visual progress indicator with active status for compression and decompression.
+- **Process & Write Safety**: Inspects open file descriptors via `lsof` and skips actively running sessions.
 
 ---
 
@@ -48,26 +39,27 @@ The binary will be available at `target/release/scompress`.
 
 ### Interactive TUI
 
-Launch the interactive terminal interface:
+Launch the full interactive terminal UI:
 
 ```bash
 scompress
 ```
 
 ```text
-┌─ scompress ──────────────────────────────────────────┐
-│ Tool      Files     Logical      Disk      Saved     │
-│ Codex       229      6.4 GB    2.1 GB     4.3 GB     │
-│ Claude       61      1.4 GB     96 MB     1.3 GB     │
-├──────────────────────────────────────────────────────┤
-│ ▼ Codex (229 files, 6.4 GB → 2.1 GB, Saved 4.3 GB)   │
-│   ▼ scompress (12 sessions, 450 MB → 30 MB)          │
-│       [✓] Fix session tree rendering  ◉ compressed   │
-│       [✓] Add Applesauce backend      ◉ compressed   │
-│   ▶ rchat (35 sessions, 850 MB → 210 MB)             │
-│                                                      │
-│ s Select  S Range  Space Toggle  c Compress  q Quit  │
-└──────────────────────────────────────────────────────┘
+┌── scompress ─────────────────────────────────────────────┐
+│ Tool       Files       Logical         Disk        Saved │
+├──────────────────────────────────────────────────────────┤
+│ Codex       229      6.4 GB    2.1 GB     4.3 GB         │
+│ Claude       61      1.4 GB     96 MB     1.3 GB         │
+├──────────────────────────────────────────────────────────┤
+│ ▼ Codex [Date ↓] (229 files, 6.4 GB → 2.1 GB, Saved 4.3 GB)
+│   ▼ scompress (12 sessions, 450 MB → 30 MB)              │
+│       [✓] Fix session tree rendering  ◉ compressed   45 MB → 3 MB   2 days ago │
+│       [✓] Add Applesauce backend      ◉ compressed   32 MB → 2 MB   3 days ago │
+│   ▶ rchat (35 sessions, 850 MB → 210 MB)                 │
+│                                                          │
+│ s Select  S Range  o Sort  Space Toggle  c Compress      │
+└──────────────────────────────────────────────────────────┘
 ```
 
 #### TUI Keybindings
@@ -76,6 +68,7 @@ scompress
 | --- | --- |
 | `s` | Toggle selection for highlighted node (Session / Project / Tool) |
 | `S` (`Shift + S`) | Select range from anchor to cursor |
+| `o` / `O` | Cycle sort order (Date ↑/↓, Size ↑/↓, Name ↑/↓). Tool-level overrides project-level. |
 | `Esc` / `x` | Clear selection |
 | `Space` / `Enter` | Expand / collapse highlighted project or tool node |
 | `e` / `Tab` | Expand / collapse all nodes |
@@ -107,36 +100,43 @@ scompress list claude
 Compress all eligible Codex and Claude Code session files:
 
 ```bash
-# Compress all
+# Compress all eligible sessions
 scompress compress
-# or shorthand:
-scompress c
 
-# Filter by tool
-scompress c codex
-scompress c claude
+# Compress only Codex sessions
+scompress compress codex
+
+# Compress only Claude sessions
+scompress compress claude
 ```
 
 #### 3. Decompress Sessions
 
-Restore compressed files back to their uncompressed on-disk state:
+Restore sessions to standard uncompressed files:
 
 ```bash
 # Decompress all
 scompress decompress
-# or shorthand:
-scompress dc
 
 # Filter by tool
-scompress dc codex
-scompress dc claude
+scompress decompress codex
+scompress decompress claude
 ```
 
 ---
 
-## Development & Testing
+## Safety Guarantees
 
-Run unit and integration tests using [`cargo-nextest`](https://nexte.st/):
+1. **Active Session Detection**: Scans open file descriptors via `lsof`. If Codex or Claude is currently writing to a transcript file, it is automatically skipped.
+2. **Freshness Guard**: Files modified within the last 30 seconds are skipped to avoid races with recently terminated agents.
+3. **Symlink Protection**: Symlinks are never followed or modified.
+4. **Idempotency**: Already compressed files are detected and untouched.
+
+---
+
+## Testing
+
+Run the test suite using `nextest`:
 
 ```bash
 cargo nextest run
@@ -144,21 +144,6 @@ cargo nextest run
 
 ---
 
-## Architecture
-
-```text
-src/
-├── main.rs        # CLI routing & async entrypoint
-├── cli.rs         # Clap command definitions & CLI handlers
-├── tui.rs         # Ratatui TUI rendering, selection mode & tree event loop
-├── scanner.rs     # Codex & Claude session discovery & thread metadata
-├── applesauce.rs  # applesauce crate integration for LZFSE compression
-├── safety.rs      # lsof process inspection & safety rules
-└── model.rs       # Tool, ProjectGroup, ToolGroup & SessionFile models
-```
-
----
-
 ## License
 
-MIT OR Apache-2.0
+MIT License. See [LICENSE](LICENSE) for details.

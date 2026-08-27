@@ -20,13 +20,11 @@ fn main() -> anyhow::Result<()> {
         }
     });
 
-    if let Err(ref e) = res {
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::BrokenPipe {
+    if let Err(ref e) = res
+        && let Some(io_err) = e.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::BrokenPipe {
                 return Ok(());
             }
-        }
-    }
 
     res
 }

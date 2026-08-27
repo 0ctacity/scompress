@@ -2,7 +2,7 @@ use crate::applesauce::{
     OpType, ProgressEvent, compress_sync_with_progress, decompress_sync_with_progress, inspect_file,
 };
 use crate::cli::{format_relative_time, format_size};
-use crate::model::{SessionFile, Tool, ToolGroup};
+use crate::model::{SessionFile, SortConfig, Tool, ToolGroup};
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
 use crate::scanner::{build_tool_groups, claude_projects_dir, codex_sessions_dir, scan_all};
 use anyhow::Result;
@@ -69,6 +69,8 @@ pub struct App {
     pub row_ops: HashMap<PathBuf, ActiveOp>,
     pub progress_tx: smol::channel::Sender<ProgressEvent>,
     pub progress_rx: smol::channel::Receiver<ProgressEvent>,
+    pub tool_sorts: HashMap<Tool, SortConfig>,
+    pub project_sorts: HashMap<(Tool, String), SortConfig>,
 }
 
 impl App {
@@ -82,16 +84,93 @@ impl App {
             last_selected_index: None,
             visible_items: Vec::new(),
             selected_index: 0,
-            status_message: "s: Select | S: Range select | c: Compress | d: Decompress | Space: Toggle node | r: Refresh".to_string(),
+            status_message: "s: Select | S: Range select | o: Sort | c: Compress | d: Decompress | Space: Toggle node | r: Refresh".to_string(),
             is_busy: false,
             row_ops: HashMap::new(),
             progress_tx: tx,
             progress_rx: rx,
+            tool_sorts: HashMap::new(),
+            project_sorts: HashMap::new(),
         }
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<SessionFile>) {
         self.tool_groups = build_tool_groups(&sessions);
+        self.apply_sorting();
+        self.rebuild_visible_items();
+    }
+
+    pub fn apply_sorting(&mut self) {
+        for tg in &mut self.tool_groups {
+            let tool_sort = self
+                .tool_sorts
+                .get(&tg.tool)
+                .copied()
+                .unwrap_or(SortConfig::DEFAULT);
+            tg.sort_projects(tool_sort);
+
+            for pg in &mut tg.projects {
+                let session_sort = if let Some(ts) = self.tool_sorts.get(&tg.tool) {
+                    *ts
+                } else if let Some(ps) = self.project_sorts.get(&(tg.tool, pg.name.clone())) {
+                    *ps
+                } else {
+                    SortConfig::DEFAULT
+                };
+                pg.sort_sessions(session_sort);
+            }
+        }
+    }
+
+    pub fn cycle_sort_current(&mut self) {
+        if self.visible_items.is_empty() {
+            return;
+        }
+
+        match &self.visible_items[self.selected_index] {
+            TreeItem::ToolHeader { tool, .. } => {
+                let current = self
+                    .tool_sorts
+                    .get(tool)
+                    .copied()
+                    .unwrap_or(SortConfig::DEFAULT);
+                let next = current.next();
+                self.tool_sorts.insert(*tool, next);
+                // Higher hierarchy overrides project-wise: clear individual project overrides under this tool
+                self.project_sorts.retain(|(t, _), _| t != tool);
+                self.status_message = format!("Sorted {} by {}", tool, next.label());
+            }
+            TreeItem::ProjectHeader { tool, project, .. } => {
+                let key = (*tool, project.clone());
+                let current = self
+                    .project_sorts
+                    .get(&key)
+                    .or_else(|| self.tool_sorts.get(tool))
+                    .copied()
+                    .unwrap_or(SortConfig::DEFAULT);
+                let next = current.next();
+                // Clear tool-level override so this specific project can be custom-sorted
+                self.tool_sorts.remove(tool);
+                self.project_sorts.insert(key, next);
+                self.status_message = format!("Sorted project '{}' by {}", project, next.label());
+            }
+            TreeItem::SessionItem { session } => {
+                let key = (session.tool, session.project.clone());
+                let current = self
+                    .project_sorts
+                    .get(&key)
+                    .or_else(|| self.tool_sorts.get(&session.tool))
+                    .copied()
+                    .unwrap_or(SortConfig::DEFAULT);
+                let next = current.next();
+                self.tool_sorts.remove(&session.tool);
+                self.project_sorts.insert(key, next);
+                self.status_message =
+                    format!("Sorted project '{}' by {}", session.project, next.label());
+            }
+        }
+
+        self.apply_sorting();
         self.rebuild_visible_items();
     }
 
@@ -230,6 +309,7 @@ impl App {
                         count,
                         if count == 1 { "" } else { "s" }
                     );
+                    self.apply_sorting();
                     self.rebuild_visible_items();
                 }
             }
@@ -298,7 +378,7 @@ impl App {
                     .flat_map(|tg| {
                         tg.projects
                             .iter()
-                            .flat_map(|pg| pg.sessions.iter().map(|s| s.path.clone()))
+                            .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
                     })
                     .collect();
 
@@ -321,7 +401,7 @@ impl App {
                     .filter(|tg| tg.tool == *tool)
                     .flat_map(|tg| tg.projects.iter())
                     .filter(|pg| pg.name == *project)
-                    .flat_map(|pg| pg.sessions.iter().map(|s| s.path.clone()))
+                    .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
                     .collect();
 
                 let all_selected = !sessions.is_empty()
@@ -373,7 +453,7 @@ impl App {
                             .flat_map(|tg| {
                                 tg.projects
                                     .iter()
-                                    .flat_map(|pg| pg.sessions.iter().map(|s| s.path.clone()))
+                                    .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
                             })
                             .collect();
                         for p in sessions {
@@ -387,7 +467,7 @@ impl App {
                             .filter(|tg| tg.tool == *tool)
                             .flat_map(|tg| tg.projects.iter())
                             .filter(|pg| pg.name == *project)
-                            .flat_map(|pg| pg.sessions.iter().map(|s| s.path.clone()))
+                            .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
                             .collect();
                         for p in sessions {
                             self.selected_sessions.insert(p);
@@ -621,6 +701,9 @@ async fn run_app_loop(
                 KeyCode::Char('x') => {
                     app.clear_selection();
                 }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    app.cycle_sort_current();
+                }
                 KeyCode::Char('r') => {
                     app.refresh().await?;
                 }
@@ -796,6 +879,12 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::DarkGray)
                 };
 
+                let sort_tag = if let Some(s) = app.tool_sorts.get(tool) {
+                    format!(" [{}]", s.short_label())
+                } else {
+                    "".to_string()
+                };
+
                 let info_str = if let Some(tg) = tg_opt {
                     format!(
                         " ({} files, {} → {}, Saved {})",
@@ -823,6 +912,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled(sort_tag, Style::default().fg(Color::Magenta)),
                     Span::styled(info_str, Style::default().fg(Color::DarkGray)),
                 ];
                 lines.push(Line::from(spans).style(line_style));
@@ -873,6 +963,12 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::DarkGray)
                 };
 
+                let sort_tag = if let Some(s) = app.project_sorts.get(&(*tool, project.clone())) {
+                    format!(" [{}]", s.short_label())
+                } else {
+                    "".to_string()
+                };
+
                 let info_str = if let Some(pg) = pg_opt {
                     format!(
                         " ({} sessions, {} → {}, Saved {})",
@@ -900,6 +996,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled(sort_tag, Style::default().fg(Color::Magenta)),
                     Span::styled(info_str, Style::default().fg(Color::DarkGray)),
                 ];
                 lines.push(Line::from(spans).style(line_style));
@@ -919,7 +1016,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                 let time_str = format_relative_time(session.modified_at, now);
                 let label = session.label();
 
-                let right_block_len = 44;
+                let right_block_len = 48;
                 let left_indent = 10;
                 let available_title_len = total_width
                     .saturating_sub(right_block_len + left_indent)
@@ -988,7 +1085,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                                     "decompressed"
                                 };
                                 spans.push(Span::styled(
-                                    format!("✓ {:<12}", action_done),
+                                    format!("✓ {:<11}", action_done),
                                     Style::default().fg(Color::Green),
                                 ));
                                 spans.push(Span::styled(
@@ -998,6 +1095,11 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                                         format_size(session.physical_size)
                                     ),
                                     Style::default().fg(Color::Green),
+                                ));
+                                spans.push(Span::raw("  "));
+                                spans.push(Span::styled(
+                                    format!("{:<12}", time_str),
+                                    Style::default().fg(Color::DarkGray),
                                 ));
                             } else {
                                 spans.push(Span::styled(
@@ -1020,17 +1122,23 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                         ),
                         Style::default().fg(Color::Green),
                     ));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        format!("{:<12}", time_str),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 } else {
                     spans.push(Span::styled(
                         "● normal     ",
                         Style::default().fg(Color::Blue),
                     ));
                     spans.push(Span::styled(
-                        format!(
-                            "{:>8}   {:<12}",
-                            format_size(session.logical_size),
-                            time_str
-                        ),
+                        format!("{:>19}", format_size(session.logical_size)),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        format!("{:<12}", time_str),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
@@ -1062,6 +1170,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("Range  "),
+        Span::styled(
+            "o ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Sort  "),
         Span::styled(
             "Space ",
             Style::default()
@@ -1172,35 +1287,14 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SessionFile, Tool};
+    use crate::model::{SessionFile, SortDirection, SortField, Tool};
     use std::path::{Path, PathBuf};
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     fn sample_app() -> App {
         let mut app = App::new();
+        let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let sessions = vec![
-            SessionFile {
-                tool: Tool::Codex,
-                project: "proj-a".to_string(),
-                title: Some("Session A1".to_string()),
-                display_title: "A1".to_string(),
-                path: PathBuf::from("/tmp/a1.jsonl"),
-                logical_size: 100,
-                physical_size: 10,
-                compressed: false,
-                modified_at: SystemTime::now(),
-            },
-            SessionFile {
-                tool: Tool::Codex,
-                project: "proj-a".to_string(),
-                title: Some("Session A2".to_string()),
-                display_title: "A2".to_string(),
-                path: PathBuf::from("/tmp/a2.jsonl"),
-                logical_size: 200,
-                physical_size: 20,
-                compressed: false,
-                modified_at: SystemTime::now(),
-            },
             SessionFile {
                 tool: Tool::Codex,
                 project: "proj-b".to_string(),
@@ -1210,7 +1304,29 @@ mod tests {
                 logical_size: 300,
                 physical_size: 30,
                 compressed: false,
-                modified_at: SystemTime::now(),
+                modified_at: base_time + Duration::from_secs(100),
+            },
+            SessionFile {
+                tool: Tool::Codex,
+                project: "proj-a".to_string(),
+                title: Some("Alpha Thread".to_string()),
+                display_title: "A1".to_string(),
+                path: PathBuf::from("/tmp/a1.jsonl"),
+                logical_size: 500,
+                physical_size: 10,
+                compressed: false,
+                modified_at: base_time + Duration::from_secs(300),
+            },
+            SessionFile {
+                tool: Tool::Codex,
+                project: "proj-a".to_string(),
+                title: Some("Beta Thread".to_string()),
+                display_title: "A2".to_string(),
+                path: PathBuf::from("/tmp/a2.jsonl"),
+                logical_size: 100,
+                physical_size: 20,
+                compressed: false,
+                modified_at: base_time + Duration::from_secs(200),
             },
         ];
         app.set_sessions(sessions);
@@ -1290,6 +1406,100 @@ mod tests {
 
         assert!(app.selected_sessions.contains(Path::new("/tmp/a1.jsonl")));
         assert!(app.selected_sessions.contains(Path::new("/tmp/b1.jsonl")));
+    }
+
+    #[test]
+    fn test_sorting_and_hierarchy_override() {
+        let mut app = sample_app();
+
+        // 1. Tool-level sort by Project Name Ascending
+        let codex_idx = app
+            .visible_items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item,
+                    TreeItem::ToolHeader {
+                        tool: Tool::Codex,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+
+        app.selected_index = codex_idx;
+        app.tool_sorts.insert(
+            Tool::Codex,
+            SortConfig {
+                field: SortField::Name,
+                direction: SortDirection::Asc,
+            },
+        );
+        app.apply_sorting();
+        app.rebuild_visible_items();
+
+        // Check project order under Codex: proj-a before proj-b
+        let projects: Vec<String> = app
+            .visible_items
+            .iter()
+            .filter_map(|item| match item {
+                TreeItem::ProjectHeader { project, .. } => Some(project.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projects, vec!["proj-a", "proj-b"]);
+
+        // 2. Project-level sort for proj-a by Size Ascending
+        let proj_a_idx = app
+            .visible_items
+            .iter()
+            .position(|item| match item {
+                TreeItem::ProjectHeader { project, .. } => project == "proj-a",
+                _ => false,
+            })
+            .unwrap();
+        app.selected_index = proj_a_idx;
+        app.tool_sorts.remove(&Tool::Codex); // Clear tool override
+        app.project_sorts.insert(
+            (Tool::Codex, "proj-a".to_string()),
+            SortConfig {
+                field: SortField::Size,
+                direction: SortDirection::Asc,
+            },
+        );
+        app.apply_sorting();
+        app.rebuild_visible_items();
+
+        let proj_a_sessions: Vec<u64> = app.tool_groups[0]
+            .projects
+            .iter()
+            .find(|p| p.name == "proj-a")
+            .unwrap()
+            .sessions
+            .iter()
+            .map(|s| s.logical_size)
+            .collect();
+        assert_eq!(proj_a_sessions, vec![100, 500]); // 100 before 500
+
+        // 3. Higher hierarchy override: Tool-level sort by Size Descending overrides proj-a
+        app.tool_sorts.insert(
+            Tool::Codex,
+            SortConfig {
+                field: SortField::Size,
+                direction: SortDirection::Desc,
+            },
+        );
+        app.apply_sorting();
+        let overridden_sessions: Vec<u64> = app.tool_groups[0]
+            .projects
+            .iter()
+            .find(|p| p.name == "proj-a")
+            .unwrap()
+            .sessions
+            .iter()
+            .map(|s| s.logical_size)
+            .collect();
+        assert_eq!(overridden_sessions, vec![500, 100]); // Now 500 before 100
     }
 
     #[test]

@@ -17,6 +17,83 @@ impl std::fmt::Display for Tool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortField {
+    Date,
+    Size,
+    Name,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortConfig {
+    pub field: SortField,
+    pub direction: SortDirection,
+}
+
+impl SortConfig {
+    pub const DEFAULT: Self = Self {
+        field: SortField::Date,
+        direction: SortDirection::Desc,
+    };
+
+    pub fn next(&self) -> Self {
+        match (self.field, self.direction) {
+            (SortField::Date, SortDirection::Desc) => Self {
+                field: SortField::Date,
+                direction: SortDirection::Asc,
+            },
+            (SortField::Date, SortDirection::Asc) => Self {
+                field: SortField::Size,
+                direction: SortDirection::Desc,
+            },
+            (SortField::Size, SortDirection::Desc) => Self {
+                field: SortField::Size,
+                direction: SortDirection::Asc,
+            },
+            (SortField::Size, SortDirection::Asc) => Self {
+                field: SortField::Name,
+                direction: SortDirection::Asc,
+            },
+            (SortField::Name, SortDirection::Asc) => Self {
+                field: SortField::Name,
+                direction: SortDirection::Desc,
+            },
+            (SortField::Name, SortDirection::Desc) => Self {
+                field: SortField::Date,
+                direction: SortDirection::Desc,
+            },
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match (self.field, self.direction) {
+            (SortField::Date, SortDirection::Desc) => "Date ↓ (newest first)",
+            (SortField::Date, SortDirection::Asc) => "Date ↑ (oldest first)",
+            (SortField::Size, SortDirection::Desc) => "Size ↓ (largest first)",
+            (SortField::Size, SortDirection::Asc) => "Size ↑ (smallest first)",
+            (SortField::Name, SortDirection::Asc) => "Name ↑ (A-Z)",
+            (SortField::Name, SortDirection::Desc) => "Name ↓ (Z-A)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match (self.field, self.direction) {
+            (SortField::Date, SortDirection::Desc) => "Date ↓",
+            (SortField::Date, SortDirection::Asc) => "Date ↑",
+            (SortField::Size, SortDirection::Desc) => "Size ↓",
+            (SortField::Size, SortDirection::Asc) => "Size ↑",
+            (SortField::Name, SortDirection::Asc) => "Name ↑",
+            (SortField::Name, SortDirection::Desc) => "Name ↓",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionFile {
     pub tool: Tool,
@@ -32,11 +109,10 @@ pub struct SessionFile {
 
 impl SessionFile {
     pub fn label(&self) -> &str {
-        if let Some(ref t) = self.title {
-            if !t.trim().is_empty() {
+        if let Some(ref t) = self.title
+            && !t.trim().is_empty() {
                 return t.trim();
             }
-        }
         &self.display_title
     }
 }
@@ -67,6 +143,32 @@ impl ProjectGroup {
             .max()
             .unwrap_or(SystemTime::UNIX_EPOCH)
     }
+
+    pub fn sort_sessions(&mut self, config: SortConfig) {
+        match (config.field, config.direction) {
+            (SortField::Date, SortDirection::Desc) => {
+                self.sessions
+                    .sort_by_key(|b| std::cmp::Reverse(b.modified_at));
+            }
+            (SortField::Date, SortDirection::Asc) => {
+                self.sessions.sort_by_key(|a| a.modified_at);
+            }
+            (SortField::Size, SortDirection::Desc) => {
+                self.sessions
+                    .sort_by_key(|b| std::cmp::Reverse(b.logical_size));
+            }
+            (SortField::Size, SortDirection::Asc) => {
+                self.sessions.sort_by_key(|a| a.logical_size);
+            }
+            (SortField::Name, SortDirection::Asc) => {
+                self.sessions.sort_by_key(|a| a.label().to_lowercase());
+            }
+            (SortField::Name, SortDirection::Desc) => {
+                self.sessions
+                    .sort_by_key(|b| std::cmp::Reverse(b.label().to_lowercase()));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,5 +192,31 @@ impl ToolGroup {
 
     pub fn saved_size(&self) -> u64 {
         self.logical_size().saturating_sub(self.physical_size())
+    }
+
+    pub fn sort_projects(&mut self, config: SortConfig) {
+        match (config.field, config.direction) {
+            (SortField::Date, SortDirection::Desc) => {
+                self.projects
+                    .sort_by_key(|b| std::cmp::Reverse(b.latest_modified()));
+            }
+            (SortField::Date, SortDirection::Asc) => {
+                self.projects.sort_by_key(|a| a.latest_modified());
+            }
+            (SortField::Size, SortDirection::Desc) => {
+                self.projects
+                    .sort_by_key(|b| std::cmp::Reverse(b.logical_size()));
+            }
+            (SortField::Size, SortDirection::Asc) => {
+                self.projects.sort_by_key(|a| a.logical_size());
+            }
+            (SortField::Name, SortDirection::Asc) => {
+                self.projects.sort_by_key(|a| a.name.to_lowercase());
+            }
+            (SortField::Name, SortDirection::Desc) => {
+                self.projects
+                    .sort_by_key(|b| std::cmp::Reverse(b.name.to_lowercase()));
+            }
+        }
     }
 }

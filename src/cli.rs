@@ -1,4 +1,4 @@
-use crate::applesauce::{compress, decompress};
+use crate::applesauce::{compress, decompress, inspect_file};
 use crate::model::Tool;
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
 use crate::scanner::{
@@ -139,13 +139,14 @@ pub async fn run_list(tool_filter: Option<Tool>) -> Result<()> {
                 let label = s.label();
                 let state_str = if s.compressed {
                     format!(
-                        "◉ compressed {:>8} → {:<8}",
+                        "◉ compressed {:>8} → {:<8}  {:<12}",
                         format_size(s.logical_size),
-                        format_size(s.physical_size)
+                        format_size(s.physical_size),
+                        time_str
                     )
                 } else {
                     format!(
-                        "● normal     {:>8}   {:<12}",
+                        "● normal     {:>19}  {:<12}",
                         format_size(s.logical_size),
                         time_str
                     )
@@ -167,6 +168,11 @@ pub async fn run_compress(tool_filter: Option<Tool>) -> Result<()> {
         None => scan_all().await?,
     };
 
+    if sessions.is_empty() {
+        println!("No session files found to compress.");
+        return Ok(());
+    }
+
     let mut roots = Vec::new();
     if let Some(d) = codex_sessions_dir() {
         roots.push(d);
@@ -175,40 +181,65 @@ pub async fn run_compress(tool_filter: Option<Tool>) -> Result<()> {
         roots.push(d);
     }
 
-    let open_files = smol::unblock(move || scan_open_files(&roots)).await;
+    let open_files = scan_open_files(&roots);
     let now = SystemTime::now();
 
-    let mut compressed_count = 0;
-    let mut skipped_count = 0;
-    let mut failed_count = 0;
+    let mut compressed_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut bytes_before = 0u64;
+    let mut bytes_after = 0u64;
 
     for s in sessions {
-        let name = format!("{} / {} / {}", s.tool, s.project, s.label());
         match check_compression_safety(&s, &open_files, now) {
-            Ok(()) => match compress(&s.path).await {
-                Ok(()) => {
-                    println!("✓ {}", name);
-                    compressed_count += 1;
+            Ok(()) => {
+                print!("Compressing: {} ... ", s.path.display());
+                match compress(&s.path).await {
+                    Ok(()) => {
+                        let (_, logical, physical) = inspect_file(&s.path);
+                        println!(
+                            "done ({} -> {})",
+                            format_size(logical),
+                            format_size(physical)
+                        );
+                        compressed_count += 1;
+                        bytes_before += logical;
+                        bytes_after += physical;
+                    }
+                    Err(e) => {
+                        println!("failed: {}", e);
+                        skipped_count += 1;
+                    }
                 }
-                Err(err) => {
-                    println!("✗ {}: {}", name, err);
-                    failed_count += 1;
+            }
+            Err(reason) => match reason {
+                SkipReason::AlreadyCompressed => {}
+                SkipReason::RecentlyModified => {
+                    println!("Skipping recently modified: {}", s.path.display());
+                    skipped_count += 1;
+                }
+                SkipReason::CurrentlyOpen => {
+                    println!("Skipping currently open: {}", s.path.display());
+                    skipped_count += 1;
+                }
+                SkipReason::IsSymlink => {
+                    println!("Skipping symlink: {}", s.path.display());
+                    skipped_count += 1;
+                }
+                SkipReason::NotRegularFile => {
+                    println!("Skipping non-regular file: {}", s.path.display());
+                    skipped_count += 1;
                 }
             },
-            Err(SkipReason::AlreadyCompressed) => {
-                skipped_count += 1;
-            }
-            Err(reason) => {
-                println!("✗ {}: {}", name, reason);
-                skipped_count += 1;
-            }
         }
     }
 
-    println!();
-    println!("Compressed {}", compressed_count);
-    println!("Skipped {}", skipped_count);
-    println!("Failed {}", failed_count);
+    let saved = bytes_before.saturating_sub(bytes_after);
+    println!(
+        "\nCompressed {} session files ({} skipped). Space saved: {}",
+        compressed_count,
+        skipped_count,
+        format_size(saved)
+    );
 
     Ok(())
 }
@@ -220,33 +251,34 @@ pub async fn run_decompress(tool_filter: Option<Tool>) -> Result<()> {
         None => scan_all().await?,
     };
 
-    let mut decompressed_count = 0;
-    let mut skipped_count = 0;
-    let mut failed_count = 0;
+    let compressed_sessions: Vec<_> = sessions.into_iter().filter(|s| s.compressed).collect();
 
-    for s in sessions {
-        let name = format!("{} / {} / {}", s.tool, s.project, s.label());
-        if !s.compressed {
-            skipped_count += 1;
-            continue;
-        }
+    if compressed_sessions.is_empty() {
+        println!("No compressed session files found to decompress.");
+        return Ok(());
+    }
 
+    let mut decompressed_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for s in compressed_sessions {
+        print!("Decompressing: {} ... ", s.path.display());
         match decompress(&s.path).await {
-            Ok(()) => {
-                println!("✓ {}", name);
+            Ok(_) => {
+                println!("done");
                 decompressed_count += 1;
             }
-            Err(err) => {
-                println!("✗ {}: {}", name, err);
+            Err(e) => {
+                println!("failed: {}", e);
                 failed_count += 1;
             }
         }
     }
 
-    println!();
-    println!("Decompressed {}", decompressed_count);
-    println!("Skipped {}", skipped_count);
-    println!("Failed {}", failed_count);
+    println!(
+        "\nDecompressed {} session files ({} failed).",
+        decompressed_count, failed_count
+    );
 
     Ok(())
 }
@@ -258,11 +290,12 @@ mod tests {
 
     #[test]
     fn test_format_size() {
-        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(1024), "1.0 KB");
         assert_eq!(format_size(1536), "1.5 KB");
-        assert_eq!(format_size(1024 * 1024 * 5), "5.0 MB");
-        assert_eq!(format_size(1024 * 1024 * 1024 * 3), "3.0 GB");
+        assert_eq!(format_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]
@@ -277,8 +310,8 @@ mod tests {
             "1 min ago"
         );
         assert_eq!(
-            format_relative_time(now - Duration::from_secs(240), now),
-            "4 mins ago"
+            format_relative_time(now - Duration::from_secs(120), now),
+            "2 mins ago"
         );
         assert_eq!(
             format_relative_time(now - Duration::from_secs(3600), now),
@@ -291,6 +324,10 @@ mod tests {
         assert_eq!(
             format_relative_time(now - Duration::from_secs(86400), now),
             "1 day ago"
+        );
+        assert_eq!(
+            format_relative_time(now - Duration::from_secs(172800), now),
+            "2 days ago"
         );
     }
 }
