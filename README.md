@@ -7,6 +7,8 @@ Transparent, zero-overhead APFS compression tool for **Codex** and **Claude Code
 [![CI](https://github.com/0ctacity/scompress/actions/workflows/ci.yml/badge.svg)](https://github.com/0ctacity/scompress/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+https://github.com/user-attachments/assets/a8819aca-f668-4708-9eae-1296bf1e9ed0
+
 ---
 
 ## Overview
