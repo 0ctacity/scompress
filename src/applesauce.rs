@@ -65,6 +65,7 @@ struct ChannelTask {
     op: OpType,
     total_bytes: u64,
     bytes_done: Arc<AtomicU64>,
+    last_reported: Arc<AtomicU64>,
     sender: smol::channel::Sender<ProgressEvent>,
 }
 
@@ -72,12 +73,18 @@ impl Task for ChannelTask {
     fn increment(&self, amt: u64) {
         let prev = self.bytes_done.fetch_add(amt, Ordering::Relaxed);
         let current = prev + amt;
-        let _ = self.sender.try_send(ProgressEvent::Progress {
-            path: self.path.clone(),
-            op: self.op,
-            bytes_done: current,
-            total_bytes: self.total_bytes,
-        });
+        let last = self.last_reported.load(Ordering::Relaxed);
+        // Throttle progress events to 0.5% increments or 64KB, whichever is larger, to avoid excessive channel traffic & cloning
+        let step = (self.total_bytes / 200).max(64 * 1024);
+        if current >= self.total_bytes || current.saturating_sub(last) >= step {
+            self.last_reported.store(current, Ordering::Relaxed);
+            let _ = self.sender.try_send(ProgressEvent::Progress {
+                path: self.path.clone(),
+                op: self.op,
+                bytes_done: current,
+                total_bytes: self.total_bytes,
+            });
+        }
     }
 
     fn error(&self, _message: &str) {
@@ -124,6 +131,7 @@ impl Progress for ChannelProgress {
             op: self.op,
             total_bytes: size,
             bytes_done: Arc::new(AtomicU64::new(0)),
+            last_reported: Arc::new(AtomicU64::new(0)),
             sender: self.sender.clone(),
         }
     }
@@ -265,11 +273,11 @@ mod tests {
         f.flush().unwrap();
         drop(f);
 
-        compress_sync_with_progress(&test_file, tx.clone()).unwrap();
+        compress_sync_with_progress(&test_file, tx).unwrap();
 
         let mut events = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            events.push(ev);
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
         }
 
         assert!(!events.is_empty());

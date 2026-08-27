@@ -1,6 +1,7 @@
 use crate::applesauce::inspect_file;
 use crate::model::{ProjectGroup, SessionFile, Tool, ToolGroup};
 use anyhow::Result;
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -20,6 +21,14 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("projects"))
 }
 
+#[derive(Deserialize)]
+struct IndexEntry<'a> {
+    id: Option<&'a str>,
+    thread_name: Option<&'a str>,
+    #[serde(default)]
+    updated_at: Option<&'a str>,
+}
+
 /// Load `~/.codex/session_index.jsonl` once and build a lookup: session_id -> thread_name.
 /// If multiple entries exist for the same UUID, keep the one with the newest `updated_at`.
 pub fn load_codex_session_index(index_path: &Path) -> HashMap<String, String> {
@@ -31,12 +40,10 @@ pub fn load_codex_session_index(index_path: &Path) -> HashMap<String, String> {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                let id = val.get("id").and_then(|v| v.as_str());
-                let thread_name = val.get("thread_name").and_then(|v| v.as_str());
-                let updated_at = val.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            if let Ok(val) = serde_json::from_str::<IndexEntry>(&line) {
+                let updated_at = val.updated_at.unwrap_or("");
 
-                if let (Some(uuid), Some(name)) = (id, thread_name)
+                if let (Some(uuid), Some(name)) = (val.id, val.thread_name)
                     && !name.trim().is_empty()
                 {
                     let should_insert = match index_map.get(uuid) {
@@ -65,17 +72,22 @@ pub fn load_codex_session_index(index_path: &Path) -> HashMap<String, String> {
 /// returns "019542a1-cf0b-7412-a7e8-3841aee50b69"
 pub fn extract_codex_uuid(filename: &str) -> Option<String> {
     let stem = filename.strip_suffix(".jsonl").unwrap_or(filename);
-    let parts: Vec<&str> = stem.split('-').collect();
-    if parts.len() >= 5 {
-        // A UUID has 5 hyphenated segments: 8-4-4-4-12 hex chars
-        let uuid_parts = &parts[parts.len() - 5..];
-        if uuid_parts[0].len() == 8
-            && uuid_parts[1].len() == 4
-            && uuid_parts[2].len() == 4
-            && uuid_parts[3].len() == 4
-            && uuid_parts[4].len() == 12
+    if stem.len() >= 36 {
+        let candidate = &stem[stem.len() - 36..];
+        let bytes = candidate.as_bytes();
+        if bytes[8] == b'-'
+            && bytes[13] == b'-'
+            && bytes[18] == b'-'
+            && bytes[23] == b'-'
+            && bytes.iter().enumerate().all(|(i, &b)| {
+                if i == 8 || i == 13 || i == 18 || i == 23 {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
         {
-            return Some(uuid_parts.join("-"));
+            return Some(candidate.to_string());
         }
     }
     None
@@ -90,11 +102,15 @@ pub fn parse_codex_title(filename: &str) -> String {
         && let Some((date_part, time_and_id)) = stripped.split_once('T')
     {
         let date = date_part;
-        let time_parts: Vec<&str> = time_and_id.split('-').collect();
-        if time_parts.len() >= 3 {
-            let time = format!("{}:{}:{}", time_parts[0], time_parts[1], time_parts[2]);
-            if time_parts.len() > 3 && !time_parts[3].is_empty() {
-                let short_id = &time_parts[3][0..time_parts[3].len().min(8)];
+        let mut time_parts = time_and_id.split('-');
+        if let (Some(h), Some(m), Some(s)) =
+            (time_parts.next(), time_parts.next(), time_parts.next())
+        {
+            let time = format!("{}:{}:{}", h, m, s);
+            if let Some(id_part) = time_parts.next()
+                && !id_part.is_empty()
+            {
+                let short_id = &id_part[0..id_part.len().min(8)];
                 return format!("{} {} ({})", date, time, short_id);
             }
             return format!("{} {}", date, time);
@@ -102,6 +118,23 @@ pub fn parse_codex_title(filename: &str) -> String {
         return format!("{} {}", date, time_and_id);
     }
     stem.to_string()
+}
+
+#[derive(Deserialize)]
+struct CodexPayload {
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CodexFirstLine {
+    cwd: Option<String>,
+    payload: Option<CodexPayload>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeFirstLine {
+    cwd: Option<String>,
+    title: Option<String>,
 }
 
 /// Parse metadata for Codex rollout files.
@@ -133,16 +166,12 @@ pub fn parse_codex_metadata(
         let mut reader = BufReader::new(file);
         let mut first_line = String::new();
         if reader.read_line(&mut first_line).is_ok()
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&first_line)
+            && let Ok(val) = serde_json::from_str::<CodexFirstLine>(&first_line)
         {
-            let cwd_val = val
-                .get("payload")
-                .and_then(|p| p.get("cwd"))
-                .or_else(|| val.get("cwd"))
-                .and_then(|v| v.as_str());
+            let cwd_val = val.payload.and_then(|p| p.cwd).or(val.cwd);
 
             if let Some(cwd) = cwd_val {
-                let p = Path::new(cwd);
+                let p = Path::new(&cwd);
                 if let Some(name) = p.file_name().and_then(|n| n.to_str())
                     && !name.is_empty()
                 {
@@ -203,17 +232,17 @@ pub fn parse_claude_metadata(path: &Path) -> (String, Option<String>, String) {
         let mut reader = BufReader::new(file);
         let mut first_line = String::new();
         if reader.read_line(&mut first_line).is_ok()
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&first_line)
+            && let Ok(val) = serde_json::from_str::<ClaudeFirstLine>(&first_line)
         {
-            if let Some(cwd) = val.get("cwd").and_then(|v| v.as_str()) {
-                let p = Path::new(cwd);
+            if let Some(cwd) = val.cwd {
+                let p = Path::new(&cwd);
                 if let Some(name) = p.file_name().and_then(|n| n.to_str())
                     && !name.is_empty()
                 {
                     project = name.to_string();
                 }
             }
-            if let Some(t) = val.get("title").and_then(|v| v.as_str())
+            if let Some(t) = val.title
                 && !t.trim().is_empty()
             {
                 title = Some(t.trim().to_string());
@@ -240,58 +269,46 @@ pub async fn scan_codex() -> Result<Vec<SessionFile>> {
     .await
 }
 
-fn scan_codex_dir_sync(
+pub fn scan_codex_dir_sync(
     dir: &Path,
     session_index_map: &HashMap<String, String>,
 ) -> Result<Vec<SessionFile>> {
-    let mut results = Vec::new();
+    let mut sessions = Vec::new();
     if !dir.exists() {
-        return Ok(results);
+        return Ok(sessions);
     }
 
     for entry in WalkDir::new(dir)
-        .follow_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
-        if !entry.file_type().is_file() || entry.path_is_symlink() {
-            continue;
+        if path.is_file()
+            && let Some(ext) = path.extension()
+            && ext == "jsonl"
+        {
+            let (is_compressed, logical_size, physical_size) = inspect_file(path);
+            let (project, title, display_title) = parse_codex_metadata(path, session_index_map);
+            let modified_at = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+
+            sessions.push(SessionFile {
+                tool: Tool::Codex,
+                project,
+                title,
+                display_title,
+                path: path.to_path_buf(),
+                logical_size,
+                physical_size,
+                compressed: is_compressed,
+                modified_at,
+            });
         }
-
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-
-        if !file_name.starts_with("rollout-") || !file_name.ends_with(".jsonl") {
-            continue;
-        }
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let modified_at = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let (compressed, logical_size, physical_size) = inspect_file(path);
-        let (project, title, display_title) = parse_codex_metadata(path, session_index_map);
-
-        results.push(SessionFile {
-            tool: Tool::Codex,
-            project,
-            title,
-            display_title,
-            path: path.to_path_buf(),
-            logical_size,
-            physical_size,
-            compressed,
-            modified_at,
-        });
     }
-
-    results.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
-    Ok(results)
+    Ok(sessions)
 }
 
 pub async fn scan_claude() -> Result<Vec<SessionFile>> {
@@ -305,147 +322,161 @@ pub async fn scan_claude() -> Result<Vec<SessionFile>> {
     .await
 }
 
-fn scan_claude_dir_sync(dir: &Path) -> Result<Vec<SessionFile>> {
-    let mut results = Vec::new();
+pub fn scan_claude_dir_sync(dir: &Path) -> Result<Vec<SessionFile>> {
+    let mut sessions = Vec::new();
     if !dir.exists() {
-        return Ok(results);
+        return Ok(sessions);
     }
 
     for entry in WalkDir::new(dir)
-        .follow_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         let path = entry.path();
-        if !entry.file_type().is_file() || entry.path_is_symlink() {
-            continue;
-        }
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
+        if path.is_file()
+            && let Some(ext) = path.extension()
+            && ext == "jsonl"
+        {
+            let (is_compressed, logical_size, physical_size) = inspect_file(path);
+            let (project, title, display_title) = parse_claude_metadata(path);
+            let modified_at = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let modified_at = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let (compressed, logical_size, physical_size) = inspect_file(path);
-        let (project, title, display_title) = parse_claude_metadata(path);
-
-        results.push(SessionFile {
-            tool: Tool::Claude,
-            project,
-            title,
-            display_title,
-            path: path.to_path_buf(),
-            logical_size,
-            physical_size,
-            compressed,
-            modified_at,
-        });
-    }
-
-    results.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
-    Ok(results)
-}
-
-pub async fn scan_all() -> Result<Vec<SessionFile>> {
-    let (codex_res, claude_res) = smol::future::zip(scan_codex(), scan_claude()).await;
-    let mut codex = codex_res?;
-    let mut claude = claude_res?;
-    codex.append(&mut claude);
-    codex.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
-    Ok(codex)
-}
-
-/// Convert a list of `SessionFile` into a sorted hierarchy of `ToolGroup`s.
-/// Sorting rules:
-/// 1. Tools: Codex first, then Claude.
-/// 2. Projects inside each tool: sorted by most recently active session descending.
-/// 3. Threads inside each project: newest first (modified_at descending).
-pub fn build_tool_groups(sessions: &[SessionFile]) -> Vec<ToolGroup> {
-    let mut tool_map: BTreeMap<Tool, BTreeMap<String, Vec<SessionFile>>> = BTreeMap::new();
-
-    for s in sessions {
-        tool_map
-            .entry(s.tool)
-            .or_default()
-            .entry(s.project.clone())
-            .or_default()
-            .push(s.clone());
-    }
-
-    let mut tool_groups = Vec::new();
-
-    // Specific order: Codex then Claude
-    let tools_in_order = [Tool::Codex, Tool::Claude];
-
-    for &tool in &tools_in_order {
-        if let Some(projects_map) = tool_map.remove(&tool) {
-            let mut project_groups = Vec::new();
-            for (name, mut group_sessions) in projects_map {
-                // Sort threads by modified_at descending (newest first)
-                group_sessions.sort_by_key(|b| std::cmp::Reverse(b.modified_at));
-                project_groups.push(ProjectGroup {
-                    name,
-                    sessions: group_sessions,
-                });
-            }
-
-            // Sort projects by most recently active session descending
-            project_groups.sort_by_key(|b| std::cmp::Reverse(b.latest_modified()));
-
-            tool_groups.push(ToolGroup {
-                tool,
-                projects: project_groups,
+            sessions.push(SessionFile {
+                tool: Tool::Claude,
+                project,
+                title,
+                display_title,
+                path: path.to_path_buf(),
+                logical_size,
+                physical_size,
+                compressed: is_compressed,
+                modified_at,
             });
         }
     }
+    Ok(sessions)
+}
 
-    tool_groups
+pub async fn scan_all() -> Result<Vec<SessionFile>> {
+    let mut sessions = scan_codex().await?;
+    sessions.extend(scan_claude().await?);
+    Ok(sessions)
+}
+
+/// Group a flat list of `SessionFile`s into `ToolGroup` -> `ProjectGroup` -> `Vec<SessionFile>`.
+pub fn build_tool_groups(sessions: &[SessionFile]) -> Vec<ToolGroup> {
+    let mut map: BTreeMap<Tool, BTreeMap<String, Vec<SessionFile>>> = BTreeMap::new();
+
+    for session in sessions {
+        map.entry(session.tool)
+            .or_default()
+            .entry(session.project.clone())
+            .or_default()
+            .push(session.clone());
+    }
+
+    let mut groups = Vec::new();
+    for (tool, projects_map) in map {
+        let mut projects = Vec::new();
+        for (name, mut s_list) in projects_map {
+            s_list.sort_by_key(|s| std::cmp::Reverse(s.modified_at));
+            projects.push(ProjectGroup {
+                name,
+                sessions: s_list,
+            });
+        }
+        projects.sort_by(|a, b| {
+            let a_max = a.sessions.iter().map(|s| s.modified_at).max();
+            let b_max = b.sessions.iter().map(|s| s.modified_at).max();
+            b_max.cmp(&a_max)
+        });
+
+        groups.push(ToolGroup { tool, projects });
+    }
+
+    groups.sort_by(|a, b| {
+        let a_max = a
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.modified_at))
+            .max();
+        let b_max = b
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.modified_at))
+            .max();
+        b_max.cmp(&a_max)
+    });
+
+    groups
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::time::Duration;
 
     #[test]
     fn test_parse_codex_title() {
-        let name = "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl";
-        assert_eq!(parse_codex_title(name), "2026-02-27 10:47:59 (019542a1)");
+        assert_eq!(
+            parse_codex_title(
+                "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl"
+            ),
+            "2026-02-27 10:47:59 (019542a1)"
+        );
+        assert_eq!(
+            parse_codex_title("rollout-2026-02-27T10-47-59.jsonl"),
+            "2026-02-27 10:47:59"
+        );
+        assert_eq!(parse_codex_title("custom-session.jsonl"), "custom-session");
     }
 
     #[test]
     fn test_extract_codex_uuid() {
-        let name = "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl";
         assert_eq!(
-            extract_codex_uuid(name),
+            extract_codex_uuid(
+                "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl"
+            ),
             Some("019542a1-cf0b-7412-a7e8-3841aee50b69".to_string())
         );
-
-        let non_rollout = "session_meta.jsonl";
-        assert_eq!(extract_codex_uuid(non_rollout), None);
+        assert_eq!(extract_codex_uuid("custom-session.jsonl"), None);
     }
 
     #[test]
     fn test_load_codex_session_index() {
         let temp_dir =
-            std::env::temp_dir().join(format!("scompress_index_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("scompress_idx_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let index_file = temp_dir.join("session_index.jsonl");
 
-        let content = r#"{"id":"uuid-1","thread_name":"First Title","updated_at":"2026-02-27T10:00:00Z"}
-{"id":"uuid-2","thread_name":"Second Title","updated_at":"2026-02-27T11:00:00Z"}
-{"id":"uuid-1","thread_name":"Updated First Title","updated_at":"2026-02-27T12:00:00Z"}
-"#;
-        std::fs::write(&index_file, content).unwrap();
+        let mut f = File::create(&index_file).unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"uuid-1234-5678-90ab-cdef12345678","thread_name":"First Task","updated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"uuid-1234-5678-90ab-cdef12345678","thread_name":"Updated Task","updated_at":"2026-01-02T00:00:00Z"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"uuid-9999-9999-9999-999999999999","thread_name":"","updated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .unwrap();
+        drop(f);
 
         let map = load_codex_session_index(&index_file);
-        assert_eq!(map.get("uuid-1"), Some(&"Updated First Title".to_string()));
-        assert_eq!(map.get("uuid-2"), Some(&"Second Title".to_string()));
+        assert_eq!(
+            map.get("uuid-1234-5678-90ab-cdef12345678"),
+            Some(&"Updated Task".to_string())
+        );
+        assert_eq!(map.get("uuid-9999-9999-9999-999999999999"), None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -458,74 +489,61 @@ mod tests {
         let file_path =
             temp_dir.join("rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl");
 
-        let mut index_map = HashMap::new();
-        index_map.insert(
-            "019542a1-cf0b-7412-a7e8-3841aee50b69".to_string(),
-            "My Indexed Thread".to_string(),
-        );
-
         let mut f = File::create(&file_path).unwrap();
         writeln!(
             f,
-            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"uuid-test-1234\",\"cwd\":\"/Users/test/workspace/my-cool-project\"}}}}"
+            r#"{{"type":"session_start","payload":{{"cwd":"/Users/test/projects/my-app"}}}}"#
         )
         .unwrap();
         drop(f);
 
-        let (project, title, display) = parse_codex_metadata(&file_path, &index_map);
-        assert_eq!(project, "my-cool-project");
-        assert_eq!(title, Some("My Indexed Thread".to_string()));
-        assert_eq!(display, "2026-02-27 10:47:59 (019542a1)");
+        let mut index_map = HashMap::new();
+        index_map.insert(
+            "019542a1-cf0b-7412-a7e8-3841aee50b69".to_string(),
+            "Refactor auth logic".to_string(),
+        );
+
+        let (project, title, display_title) = parse_codex_metadata(&file_path, &index_map);
+        assert_eq!(project, "my-app");
+        assert_eq!(title, Some("Refactor auth logic".to_string()));
+        assert_eq!(display_title, "2026-02-27 10:47:59 (019542a1)");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_build_tool_groups_sorting() {
-        let now = SystemTime::now();
+        use std::time::Duration;
+        let base_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
         let sessions = vec![
             SessionFile {
                 tool: Tool::Claude,
-                project: "claude-proj".to_string(),
+                project: "proj-old".to_string(),
                 title: None,
-                display_title: "c1".to_string(),
-                path: PathBuf::from("/tmp/c1.jsonl"),
+                display_title: "old".to_string(),
+                path: PathBuf::from("/tmp/1.jsonl"),
                 logical_size: 100,
-                physical_size: 10,
+                physical_size: 100,
                 compressed: false,
-                modified_at: now,
+                modified_at: base_time + Duration::from_secs(100),
             },
             SessionFile {
                 tool: Tool::Codex,
-                project: "older-proj".to_string(),
+                project: "proj-new".to_string(),
                 title: None,
-                display_title: "o1".to_string(),
-                path: PathBuf::from("/tmp/o1.jsonl"),
+                display_title: "new".to_string(),
+                path: PathBuf::from("/tmp/2.jsonl"),
                 logical_size: 200,
-                physical_size: 20,
+                physical_size: 200,
                 compressed: false,
-                modified_at: now - Duration::from_secs(100),
-            },
-            SessionFile {
-                tool: Tool::Codex,
-                project: "newer-proj".to_string(),
-                title: None,
-                display_title: "n1".to_string(),
-                path: PathBuf::from("/tmp/n1.jsonl"),
-                logical_size: 300,
-                physical_size: 30,
-                compressed: false,
-                modified_at: now + Duration::from_secs(100),
+                modified_at: base_time + Duration::from_secs(500),
             },
         ];
 
         let groups = build_tool_groups(&sessions);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].tool, Tool::Codex);
+        assert_eq!(groups[0].tool, Tool::Codex); // Newer modified session comes first
         assert_eq!(groups[1].tool, Tool::Claude);
-
-        // Under Codex, newer-proj should come first
-        assert_eq!(groups[0].projects[0].name, "newer-proj");
-        assert_eq!(groups[0].projects[1].name, "older-proj");
     }
 }

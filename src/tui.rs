@@ -411,48 +411,72 @@ impl App {
 
         match &self.visible_items[self.selected_index] {
             TreeItem::ToolHeader { tool, .. } => {
-                let sessions: Vec<PathBuf> = self
+                let all_selected = self
                     .tool_groups
                     .iter()
                     .filter(|tg| tg.tool == *tool)
-                    .flat_map(|tg| {
-                        tg.projects
-                            .iter()
-                            .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
-                    })
-                    .collect();
+                    .flat_map(|tg| tg.projects.iter().flat_map(|pg| pg.sessions.iter()))
+                    .all(|s| self.selected_sessions.contains(&s.path))
+                    && self
+                        .tool_groups
+                        .iter()
+                        .filter(|tg| tg.tool == *tool)
+                        .flat_map(|tg| tg.projects.iter().flat_map(|pg| pg.sessions.iter()))
+                        .next()
+                        .is_some();
 
-                let all_selected = !sessions.is_empty()
-                    && sessions.iter().all(|p| self.selected_sessions.contains(p));
                 if all_selected {
-                    for p in &sessions {
-                        self.selected_sessions.remove(p);
+                    for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                        for pg in &tg.projects {
+                            for s in &pg.sessions {
+                                self.selected_sessions.remove(&s.path);
+                            }
+                        }
                     }
                 } else {
-                    for p in sessions {
-                        self.selected_sessions.insert(p);
+                    for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                        for pg in &tg.projects {
+                            for s in &pg.sessions {
+                                self.selected_sessions.insert(s.path.clone());
+                            }
+                        }
                     }
                 }
             }
             TreeItem::ProjectHeader { tool, project, .. } => {
-                let sessions: Vec<PathBuf> = self
+                let all_selected = self
                     .tool_groups
                     .iter()
                     .filter(|tg| tg.tool == *tool)
                     .flat_map(|tg| tg.projects.iter())
                     .filter(|pg| pg.name == *project)
-                    .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
-                    .collect();
+                    .flat_map(|pg| pg.sessions.iter())
+                    .all(|s| self.selected_sessions.contains(&s.path))
+                    && self
+                        .tool_groups
+                        .iter()
+                        .filter(|tg| tg.tool == *tool)
+                        .flat_map(|tg| tg.projects.iter())
+                        .filter(|pg| pg.name == *project)
+                        .flat_map(|pg| pg.sessions.iter())
+                        .next()
+                        .is_some();
 
-                let all_selected = !sessions.is_empty()
-                    && sessions.iter().all(|p| self.selected_sessions.contains(p));
                 if all_selected {
-                    for p in &sessions {
-                        self.selected_sessions.remove(p);
+                    for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                        for pg in tg.projects.iter().filter(|p| p.name == *project) {
+                            for s in &pg.sessions {
+                                self.selected_sessions.remove(&s.path);
+                            }
+                        }
                     }
                 } else {
-                    for p in sessions {
-                        self.selected_sessions.insert(p);
+                    for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                        for pg in tg.projects.iter().filter(|p| p.name == *project) {
+                            for s in &pg.sessions {
+                                self.selected_sessions.insert(s.path.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -486,31 +510,21 @@ impl App {
             if let Some(item) = self.visible_items.get(idx) {
                 match item {
                     TreeItem::ToolHeader { tool, .. } => {
-                        let sessions: Vec<PathBuf> = self
-                            .tool_groups
-                            .iter()
-                            .filter(|tg| tg.tool == *tool)
-                            .flat_map(|tg| {
-                                tg.projects
-                                    .iter()
-                                    .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
-                            })
-                            .collect();
-                        for p in sessions {
-                            self.selected_sessions.insert(p);
+                        for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                            for pg in &tg.projects {
+                                for s in &pg.sessions {
+                                    self.selected_sessions.insert(s.path.clone());
+                                }
+                            }
                         }
                     }
                     TreeItem::ProjectHeader { tool, project, .. } => {
-                        let sessions: Vec<PathBuf> = self
-                            .tool_groups
-                            .iter()
-                            .filter(|tg| tg.tool == *tool)
-                            .flat_map(|tg| tg.projects.iter())
-                            .filter(|pg| pg.name == *project)
-                            .flat_map(|pg| pg.sessions.iter().map(|s| &s.path).cloned())
-                            .collect();
-                        for p in sessions {
-                            self.selected_sessions.insert(p);
+                        for tg in self.tool_groups.iter().filter(|tg| tg.tool == *tool) {
+                            for pg in tg.projects.iter().filter(|p| p.name == *project) {
+                                for s in &pg.sessions {
+                                    self.selected_sessions.insert(s.path.clone());
+                                }
+                            }
                         }
                     }
                     TreeItem::SessionItem { session } => {
@@ -943,16 +957,24 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
 
                 let tg_opt = app.tool_groups.iter().find(|g| g.tool == *tool);
                 let check_str = if let Some(tg) = tg_opt {
-                    let paths: Vec<&PathBuf> = tg
-                        .projects
-                        .iter()
-                        .flat_map(|pg| pg.sessions.iter().map(|s| &s.path))
-                        .collect();
-                    if paths.is_empty() {
+                    let mut has_items = false;
+                    let mut all_selected = true;
+                    let mut any_selected = false;
+                    for pg in &tg.projects {
+                        for s in &pg.sessions {
+                            has_items = true;
+                            if app.selected_sessions.contains(&s.path) {
+                                any_selected = true;
+                            } else {
+                                all_selected = false;
+                            }
+                        }
+                    }
+                    if !has_items {
                         "[ ] "
-                    } else if paths.iter().all(|p| app.selected_sessions.contains(*p)) {
+                    } else if all_selected {
                         "[✓] "
-                    } else if paths.iter().any(|p| app.selected_sessions.contains(*p)) {
+                    } else if any_selected {
                         "[-] "
                     } else {
                         "[ ] "
@@ -1026,20 +1048,20 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                 let check_str = if let Some(pg) = pg_opt {
                     if pg.sessions.is_empty() {
                         "[ ] "
-                    } else if pg
-                        .sessions
-                        .iter()
-                        .all(|s| app.selected_sessions.contains(&s.path))
-                    {
-                        "[✓] "
-                    } else if pg
-                        .sessions
-                        .iter()
-                        .any(|s| app.selected_sessions.contains(&s.path))
-                    {
-                        "[-] "
                     } else {
-                        "[ ] "
+                        let total = pg.sessions.len();
+                        let selected = pg
+                            .sessions
+                            .iter()
+                            .filter(|s| app.selected_sessions.contains(&s.path))
+                            .count();
+                        if selected == 0 {
+                            "[ ] "
+                        } else if selected == total {
+                            "[✓] "
+                        } else {
+                            "[-] "
+                        }
                     }
                 } else {
                     "[ ] "
