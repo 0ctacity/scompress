@@ -110,9 +110,10 @@ pub struct SessionFile {
 impl SessionFile {
     pub fn label(&self) -> &str {
         if let Some(ref t) = self.title
-            && !t.trim().is_empty() {
-                return t.trim();
-            }
+            && !t.trim().is_empty()
+        {
+            return t.trim();
+        }
         &self.display_title
     }
 }

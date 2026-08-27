@@ -2,6 +2,13 @@
 name = "scompress"
 version = "0.1.0"
 edition = "2024"
+authors = ["0ctacity"]
+description = "A fast TUI and CLI tool for transparently compressing and managing AI session files on macOS APFS"
+readme = "README.md"
+repository = "https://github.com/0ctacity/scompress"
+license = "MIT"
+keywords = ["compression", "tui", "apfs", "claude", "codex"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 applesauce = "0.8"
@@ -14,3 +21,27 @@ walkdir = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
+
+# Config for 'cargo dist'
+[package.metadata.dist]
+dist = true
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
