@@ -1176,23 +1176,29 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                             physical_size,
                         } => {
                             if *success {
-                                let action_done = if *op == OpType::Compressing {
-                                    "compressed"
+                                if *op == OpType::Compressing {
+                                    spans.push(Span::styled(
+                                        "✓ compressed ",
+                                        Style::default().fg(Color::Green),
+                                    ));
+                                    spans.push(Span::styled(
+                                        format!(
+                                            "{:>8} → {:<8}",
+                                            format_size(*logical_size),
+                                            format_size(*physical_size)
+                                        ),
+                                        Style::default().fg(Color::Green),
+                                    ));
                                 } else {
-                                    "decompressed"
-                                };
-                                spans.push(Span::styled(
-                                    format!("✓ {:<11}", action_done),
-                                    Style::default().fg(Color::Green),
-                                ));
-                                spans.push(Span::styled(
-                                    format!(
-                                        "{:>8} → {:<8}",
-                                        format_size(*logical_size),
-                                        format_size(*physical_size)
-                                    ),
-                                    Style::default().fg(Color::Green),
-                                ));
+                                    spans.push(Span::styled(
+                                        "✓ decompressed",
+                                        Style::default().fg(Color::Green),
+                                    ));
+                                    spans.push(Span::styled(
+                                        format!("{:>18}", format_size(*logical_size)),
+                                        Style::default().fg(Color::Green),
+                                    ));
+                                }
                                 spans.push(Span::raw("  "));
                                 spans.push(Span::styled(
                                     format!("{:<12}", time_str),
