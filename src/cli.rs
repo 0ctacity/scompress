@@ -1,9 +1,10 @@
 use crate::applesauce::{compress, decompress};
-use crate::model::Tool;
+use crate::model::{SessionFile, Tool};
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
 use crate::scanner::{claude_projects_dir, codex_sessions_dir, scan_all, scan_claude, scan_codex};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 #[derive(Parser, Debug)]
@@ -154,26 +155,51 @@ pub async fn run_list(tool_filter: Option<Tool>) -> Result<()> {
         );
     }
 
-    println!();
-    println!("Session files:");
+    // Group sessions by tool & project
+    let mut groups: BTreeMap<(String, String), Vec<&SessionFile>> = BTreeMap::new();
     for s in &sessions {
-        let time_str = format_relative_time(s.modified_at, now);
-        let name = s.display_name();
-        let state_str = if s.compressed {
-            format!(
-                "◉ compressed {:>8} → {:<8}",
-                format_size(s.logical_size),
-                format_size(s.physical_size)
-            )
-        } else {
-            format!(
-                "● normal     {:>8}   {:<12}",
-                format_size(s.logical_size),
-                time_str
-            )
-        };
+        groups
+            .entry((s.tool.to_string(), s.project.clone()))
+            .or_default()
+            .push(s);
+    }
 
-        println!("  {:<6} {:<40} {}", s.tool, name, state_str);
+    println!();
+    for ((tool_name, project_name), group_sessions) in groups {
+        let group_logical: u64 = group_sessions.iter().map(|s| s.logical_size).sum();
+        let group_physical: u64 = group_sessions.iter().map(|s| s.physical_size).sum();
+        let group_saved = group_logical.saturating_sub(group_physical);
+
+        println!(
+            "▼ {} / {} ({} sessions, {} → {}, Saved {})",
+            tool_name,
+            project_name,
+            group_sessions.len(),
+            format_size(group_logical),
+            format_size(group_physical),
+            format_size(group_saved)
+        );
+
+        for s in group_sessions {
+            let time_str = format_relative_time(s.modified_at, now);
+            let name = &s.display_title;
+            let state_str = if s.compressed {
+                format!(
+                    "◉ compressed {:>8} → {:<8}",
+                    format_size(s.logical_size),
+                    format_size(s.physical_size)
+                )
+            } else {
+                format!(
+                    "● normal     {:>8}   {:<12}",
+                    format_size(s.logical_size),
+                    time_str
+                )
+            };
+
+            println!("    {:<35} {}", name, state_str);
+        }
+        println!();
     }
 
     Ok(())
@@ -202,7 +228,7 @@ pub async fn run_compress(tool_filter: Option<Tool>) -> Result<()> {
     let mut failed_count = 0;
 
     for s in sessions {
-        let name = s.display_name();
+        let name = format!("{} / {}", s.project, s.display_title);
         match check_compression_safety(&s, &open_files, now) {
             Ok(()) => match compress(&s.path).await {
                 Ok(()) => {
@@ -244,7 +270,7 @@ pub async fn run_decompress(tool_filter: Option<Tool>) -> Result<()> {
     let mut failed_count = 0;
 
     for s in sessions {
-        let name = s.display_name();
+        let name = format!("{} / {}", s.project, s.display_title);
         if !s.compressed {
             skipped_count += 1;
             continue;
