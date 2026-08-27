@@ -1,4 +1,6 @@
-use crate::applesauce::{compress, decompress};
+use crate::applesauce::{
+    OpType, ProgressEvent, compress_sync_with_progress, decompress_sync_with_progress, inspect_file,
+};
 use crate::cli::{format_relative_time, format_size};
 use crate::model::{SessionFile, Tool, ToolGroup};
 use crate::safety::{SkipReason, check_compression_safety, scan_open_files};
@@ -17,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
@@ -38,6 +40,22 @@ pub enum TreeItem {
     },
 }
 
+#[derive(Clone, Debug)]
+pub enum ActiveOp {
+    Queued {
+        op: OpType,
+    },
+    Running {
+        op: OpType,
+        bytes_done: u64,
+        total_bytes: u64,
+    },
+    Finished {
+        op: OpType,
+        success: bool,
+    },
+}
+
 pub struct App {
     pub tool_groups: Vec<ToolGroup>,
     pub collapsed_tools: HashSet<Tool>,
@@ -48,10 +66,14 @@ pub struct App {
     pub selected_index: usize,
     pub status_message: String,
     pub is_busy: bool,
+    pub row_ops: HashMap<PathBuf, ActiveOp>,
+    pub progress_tx: smol::channel::Sender<ProgressEvent>,
+    pub progress_rx: smol::channel::Receiver<ProgressEvent>,
 }
 
 impl App {
     pub fn new() -> Self {
+        let (tx, rx) = smol::channel::unbounded();
         Self {
             tool_groups: Vec::new(),
             collapsed_tools: HashSet::new(),
@@ -62,6 +84,9 @@ impl App {
             selected_index: 0,
             status_message: "s: Select | S: Range select | c: Compress | d: Decompress | Space: Toggle node | r: Refresh".to_string(),
             is_busy: false,
+            row_ops: HashMap::new(),
+            progress_tx: tx,
+            progress_rx: rx,
         }
     }
 
@@ -145,6 +170,79 @@ impl App {
         Ok(())
     }
 
+    pub fn handle_progress_event(&mut self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::Started {
+                path,
+                op,
+                total_bytes,
+            } => {
+                self.row_ops.insert(
+                    path,
+                    ActiveOp::Running {
+                        op,
+                        bytes_done: 0,
+                        total_bytes,
+                    },
+                );
+            }
+            ProgressEvent::Progress {
+                path,
+                op,
+                bytes_done,
+                total_bytes,
+            } => {
+                self.row_ops.insert(
+                    path,
+                    ActiveOp::Running {
+                        op,
+                        bytes_done,
+                        total_bytes,
+                    },
+                );
+            }
+            ProgressEvent::Completed {
+                path,
+                op,
+                success,
+                error: _,
+            } => {
+                // Update file info directly in tool_groups
+                let (compressed, logical_size, physical_size) = inspect_file(&path);
+                for tg in &mut self.tool_groups {
+                    for pg in &mut tg.projects {
+                        for s in &mut pg.sessions {
+                            if s.path == path {
+                                s.compressed = compressed;
+                                s.logical_size = logical_size;
+                                s.physical_size = physical_size;
+                            }
+                        }
+                    }
+                }
+                self.row_ops
+                    .insert(path, ActiveOp::Finished { op, success });
+
+                // Check if all active operations finished
+                let still_running = self.row_ops.values().any(|op_state| match op_state {
+                    ActiveOp::Queued { .. } | ActiveOp::Running { .. } => true,
+                    ActiveOp::Finished { .. } => false,
+                });
+
+                if !still_running && self.is_busy {
+                    self.is_busy = false;
+                    let count = self.row_ops.len();
+                    self.status_message = format!(
+                        "Finished processing {} session{}",
+                        count,
+                        if count == 1 { "" } else { "s" }
+                    );
+                    self.rebuild_visible_items();
+                }
+            }
+        }
+    }
+
     pub fn toggle_current_expand(&mut self) {
         if self.visible_items.is_empty() {
             return;
@@ -191,7 +289,6 @@ impl App {
         self.rebuild_visible_items();
     }
 
-    /// Toggle selection of the current node ('s')
     pub fn toggle_select_current(&mut self) {
         if self.visible_items.is_empty() {
             return;
@@ -258,7 +355,6 @@ impl App {
         self.update_selection_status();
     }
 
-    /// Range selection from anchor to current item (Shift + 's' / 'S')
     pub fn select_range_to_current(&mut self) {
         if self.visible_items.is_empty() {
             return;
@@ -334,7 +430,6 @@ impl App {
         }
     }
 
-    /// Determine target sessions based on selection mode or currently highlighted node.
     pub fn resolve_targets(&self) -> (String, Vec<SessionFile>) {
         if !self.selected_sessions.is_empty() {
             let all = self.all_sessions();
@@ -387,100 +482,78 @@ impl App {
         }
     }
 
-    pub async fn compress_targets(&mut self) -> Result<()> {
+    pub fn start_batch_operation(&mut self, op: OpType) {
         if self.is_busy {
-            return Ok(());
+            return;
         }
+
         let (target_label, targets) = self.resolve_targets();
         if targets.is_empty() {
-            self.status_message = "No sessions to compress".to_string();
-            return Ok(());
+            self.status_message = format!("No sessions to {}", op);
+            return;
         }
 
         self.is_busy = true;
-        self.status_message = format!("Compressing {}...", target_label);
-
-        let mut roots = Vec::new();
-        if let Some(d) = codex_sessions_dir() {
-            roots.push(d);
-        }
-        if let Some(d) = claude_projects_dir() {
-            roots.push(d);
-        }
-
-        let open_files = smol::unblock(move || scan_open_files(&roots)).await;
-        let now = SystemTime::now();
-
-        let mut compressed = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
+        self.status_message = format!("Starting {} for {}...", op, target_label);
+        self.row_ops.clear();
 
         for s in &targets {
-            match check_compression_safety(s, &open_files, now) {
-                Ok(()) => match compress(&s.path).await {
-                    Ok(()) => compressed += 1,
-                    Err(_) => failed += 1,
-                },
-                Err(SkipReason::AlreadyCompressed) => {
-                    skipped += 1;
+            self.row_ops.insert(s.path.clone(), ActiveOp::Queued { op });
+        }
+
+        let tx = self.progress_tx.clone();
+        let targets_clone = targets.clone();
+
+        std::thread::spawn(move || {
+            let mut roots = Vec::new();
+            if let Some(d) = codex_sessions_dir() {
+                roots.push(d);
+            }
+            if let Some(d) = claude_projects_dir() {
+                roots.push(d);
+            }
+
+            let open_files = scan_open_files(&roots);
+            let now = SystemTime::now();
+
+            for s in targets_clone {
+                match op {
+                    OpType::Compressing => match check_compression_safety(&s, &open_files, now) {
+                        Ok(()) => {
+                            let _ = compress_sync_with_progress(&s.path, tx.clone());
+                        }
+                        Err(SkipReason::AlreadyCompressed) => {
+                            let _ = tx.try_send(ProgressEvent::Completed {
+                                path: s.path,
+                                op,
+                                success: true,
+                                error: None,
+                            });
+                        }
+                        Err(reason) => {
+                            let _ = tx.try_send(ProgressEvent::Completed {
+                                path: s.path,
+                                op,
+                                success: false,
+                                error: Some(reason.to_string()),
+                            });
+                        }
+                    },
+                    OpType::Decompressing => {
+                        if !s.compressed {
+                            let _ = tx.try_send(ProgressEvent::Completed {
+                                path: s.path,
+                                op,
+                                success: true,
+                                error: None,
+                            });
+                        } else {
+                            let _ = decompress_sync_with_progress(&s.path, tx.clone());
+                        }
+                    }
                 }
-                Err(_) => {
-                    skipped += 1;
-                }
             }
-        }
-
-        if let Ok(sessions) = scan_all().await {
-            self.set_sessions(sessions);
-        }
-
-        self.status_message = format!(
-            "Compressed {}: {} ok, {} skipped, {} failed",
-            target_label, compressed, skipped, failed
-        );
-        self.is_busy = false;
-        Ok(())
-    }
-
-    pub async fn decompress_targets(&mut self) -> Result<()> {
-        if self.is_busy {
-            return Ok(());
-        }
-        let (target_label, targets) = self.resolve_targets();
-        if targets.is_empty() {
-            self.status_message = "No sessions to decompress".to_string();
-            return Ok(());
-        }
-
-        self.is_busy = true;
-        self.status_message = format!("Decompressing {}...", target_label);
-
-        let mut decompressed = 0;
-        let mut skipped = 0;
-        let mut failed = 0;
-
-        for s in &targets {
-            if !s.compressed {
-                skipped += 1;
-                continue;
-            }
-
-            match decompress(&s.path).await {
-                Ok(()) => decompressed += 1,
-                Err(_) => failed += 1,
-            }
-        }
-
-        if let Ok(sessions) = scan_all().await {
-            self.set_sessions(sessions);
-        }
-
-        self.status_message = format!(
-            "Decompressed {}: {} ok, {} skipped, {} failed",
-            target_label, decompressed, skipped, failed
-        );
-        self.is_busy = false;
-        Ok(())
+        });
     }
 
     pub fn next(&mut self) {
@@ -519,10 +592,15 @@ async fn run_app_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> Result<()> {
-    let tick_rate = Duration::from_millis(50);
+    let tick_rate = Duration::from_millis(30);
     let mut last_tick = Instant::now();
 
     loop {
+        // Drain any incoming progress events
+        while let Ok(event) = app.progress_rx.try_recv() {
+            app.handle_progress_event(event);
+        }
+
         terminal.draw(|f| ui(f, app))?;
 
         let timeout = tick_rate
@@ -557,10 +635,10 @@ async fn run_app_loop(
                         app.refresh().await?;
                     }
                     KeyCode::Char('c') => {
-                        app.compress_targets().await?;
+                        app.start_batch_operation(OpType::Compressing);
                     }
                     KeyCode::Char('d') => {
-                        app.decompress_targets().await?;
+                        app.start_batch_operation(OpType::Decompressing);
                     }
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         app.toggle_current_expand();
@@ -852,7 +930,7 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                 let time_str = format_relative_time(session.modified_at, now);
                 let label = session.label();
 
-                let right_block_len = 42;
+                let right_block_len = 44;
                 let left_indent = 10;
                 let available_title_len = total_width
                     .saturating_sub(right_block_len + left_indent)
@@ -878,7 +956,70 @@ fn render_tree_list(f: &mut Frame, area: Rect, app: &App) {
                     Span::raw("  "),
                 ];
 
-                if session.compressed {
+                // Check if this row has an active progress/op
+                if let Some(op_state) = app.row_ops.get(&session.path) {
+                    match op_state {
+                        ActiveOp::Running {
+                            op,
+                            bytes_done,
+                            total_bytes,
+                        } => {
+                            let ratio = if *total_bytes > 0 {
+                                (*bytes_done as f64 / *total_bytes as f64).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            let percent = (ratio * 100.0) as u32;
+                            let filled = (ratio * 8.0).round() as usize;
+                            let bar = format!("[{}{}]", "█".repeat(filled), "░".repeat(8 - filled));
+
+                            spans.push(Span::styled(
+                                format!("{} {:>3}% ", bar, percent),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::styled(
+                                op.to_string(),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        ActiveOp::Queued { op } => {
+                            spans.push(Span::styled(
+                                format!("[queued] {}", op),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        ActiveOp::Finished { op, success } => {
+                            if *success {
+                                let action_done = if *op == OpType::Compressing {
+                                    "compressed"
+                                } else {
+                                    "decompressed"
+                                };
+                                spans.push(Span::styled(
+                                    format!("✓ {:<12}", action_done),
+                                    Style::default().fg(Color::Green),
+                                ));
+                                spans.push(Span::styled(
+                                    format!(
+                                        "{:>8} → {:<8}",
+                                        format_size(session.logical_size),
+                                        format_size(session.physical_size)
+                                    ),
+                                    Style::default().fg(Color::Green),
+                                ));
+                            } else {
+                                spans.push(Span::styled(
+                                    "✗ failed",
+                                    Style::default().fg(Color::Red),
+                                ));
+                            }
+                        }
+                    }
+                } else if session.compressed {
                     spans.push(Span::styled(
                         "◉ compressed ",
                         Style::default().fg(Color::Green),
@@ -1011,7 +1152,9 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
     let keybindings = Line::from(key_spans);
 
     let status_style = if app.is_busy {
-        Style::default().fg(Color::Yellow)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else if sel_count > 0 {
         Style::default()
             .fg(Color::Green)
@@ -1175,5 +1318,44 @@ mod tests {
             app.selected_sessions
                 .contains(&PathBuf::from("/tmp/b1.jsonl"))
         );
+    }
+
+    #[test]
+    fn test_handle_progress_events() {
+        let mut app = sample_app();
+        let test_path = PathBuf::from("/tmp/a1.jsonl");
+
+        app.handle_progress_event(ProgressEvent::Started {
+            path: test_path.clone(),
+            op: OpType::Compressing,
+            total_bytes: 1000,
+        });
+
+        match app.row_ops.get(&test_path) {
+            Some(ActiveOp::Running {
+                op,
+                bytes_done,
+                total_bytes,
+            }) => {
+                assert_eq!(*op, OpType::Compressing);
+                assert_eq!(*bytes_done, 0);
+                assert_eq!(*total_bytes, 1000);
+            }
+            _ => panic!("Expected Running state"),
+        }
+
+        app.handle_progress_event(ProgressEvent::Progress {
+            path: test_path.clone(),
+            op: OpType::Compressing,
+            bytes_done: 600,
+            total_bytes: 1000,
+        });
+
+        match app.row_ops.get(&test_path) {
+            Some(ActiveOp::Running { bytes_done, .. }) => {
+                assert_eq!(*bytes_done, 600);
+            }
+            _ => panic!("Expected Running state with updated bytes"),
+        }
     }
 }
