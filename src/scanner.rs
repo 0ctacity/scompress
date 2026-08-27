@@ -37,18 +37,19 @@ pub fn load_codex_session_index(index_path: &Path) -> HashMap<String, String> {
                 let updated_at = val.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
 
                 if let (Some(uuid), Some(name)) = (id, thread_name)
-                    && !name.trim().is_empty() {
-                        let should_insert = match index_map.get(uuid) {
-                            Some((_, existing_updated)) => updated_at >= existing_updated.as_str(),
-                            None => true,
-                        };
-                        if should_insert {
-                            index_map.insert(
-                                uuid.to_string(),
-                                (name.trim().to_string(), updated_at.to_string()),
-                            );
-                        }
+                    && !name.trim().is_empty()
+                {
+                    let should_insert = match index_map.get(uuid) {
+                        Some((_, existing_updated)) => updated_at >= existing_updated.as_str(),
+                        None => true,
+                    };
+                    if should_insert {
+                        index_map.insert(
+                            uuid.to_string(),
+                            (name.trim().to_string(), updated_at.to_string()),
+                        );
                     }
+                }
             }
         }
     }
@@ -80,6 +81,29 @@ pub fn extract_codex_uuid(filename: &str) -> Option<String> {
     None
 }
 
+/// Parse absolute date/time fallback from a Codex rollout filename:
+/// e.g. "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl"
+/// -> "2026-02-27 10:47:59 (019542a1)"
+pub fn parse_codex_title(filename: &str) -> String {
+    let stem = filename.strip_suffix(".jsonl").unwrap_or(filename);
+    if let Some(stripped) = stem.strip_prefix("rollout-")
+        && let Some((date_part, time_and_id)) = stripped.split_once('T')
+    {
+        let date = date_part;
+        let time_parts: Vec<&str> = time_and_id.split('-').collect();
+        if time_parts.len() >= 3 {
+            let time = format!("{}:{}:{}", time_parts[0], time_parts[1], time_parts[2]);
+            if time_parts.len() > 3 && !time_parts[3].is_empty() {
+                let short_id = &time_parts[3][0..time_parts[3].len().min(8)];
+                return format!("{} {} ({})", date, time, short_id);
+            }
+            return format!("{} {}", date, time);
+        }
+        return format!("{} {}", date, time_and_id);
+    }
+    stem.to_string()
+}
+
 /// Parse metadata for Codex rollout files.
 /// Extract project name from the first JSON line (`cwd` or `payload.cwd`),
 /// and resolve the thread name from the preloaded `session_index_map`.
@@ -87,31 +111,22 @@ pub fn parse_codex_metadata(
     path: &Path,
     session_index_map: &HashMap<String, String>,
 ) -> (String, Option<String>, String) {
-    let file_stem = path
-        .file_stem()
+    let file_name = path
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
 
-    // Display title fallback: timestamp portion or clean rollout stem
-    let display_title = if let Some(stripped) = file_stem.strip_prefix("rollout-") {
-        if let Some((ts, _uuid)) = stripped.split_once('-') {
-            ts.replace('T', " ")
-        } else {
-            stripped.to_string()
-        }
-    } else {
-        file_stem.to_string()
-    };
+    let display_title = parse_codex_title(file_name);
 
     let mut project = "unknown".to_string();
     let mut title: Option<String> = None;
 
     // Match thread_name from session_index lookup
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-        && let Some(uuid) = extract_codex_uuid(file_name)
-            && let Some(indexed_title) = session_index_map.get(&uuid) {
-                title = Some(indexed_title.clone());
-            }
+    if let Some(uuid) = extract_codex_uuid(file_name)
+        && let Some(indexed_title) = session_index_map.get(&uuid)
+    {
+        title = Some(indexed_title.clone());
+    }
 
     // Only read the first line for project/cwd - do NOT parse the entire transcript
     if let Ok(file) = File::open(path) {
@@ -167,19 +182,20 @@ pub fn parse_claude_metadata(path: &Path) -> (String, Option<String>, String) {
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        && (dir_name.starts_with('-') || dir_name.contains('_')) {
-            let clean_name = dir_name
-                .split('_')
-                .rfind(|s| !s.is_empty())
-                .unwrap_or(dir_name);
-            let clean_name = clean_name
-                .split('-')
-                .rfind(|s| !s.is_empty())
-                .unwrap_or(clean_name);
-            if !clean_name.is_empty() {
-                project = clean_name.to_string();
-            }
+        && (dir_name.starts_with('-') || dir_name.contains('_'))
+    {
+        let clean_name = dir_name
+            .split('_')
+            .rfind(|s| !s.is_empty())
+            .unwrap_or(dir_name);
+        let clean_name = clean_name
+            .split('-')
+            .rfind(|s| !s.is_empty())
+            .unwrap_or(clean_name);
+        if !clean_name.is_empty() {
+            project = clean_name.to_string();
         }
+    }
 
     let mut title = None;
 
@@ -397,6 +413,12 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn test_parse_codex_title() {
+        let name = "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl";
+        assert_eq!(parse_codex_title(name), "2026-02-27 10:47:59 (019542a1)");
+    }
+
+    #[test]
     fn test_extract_codex_uuid() {
         let name = "rollout-2026-02-27T10-47-59-019542a1-cf0b-7412-a7e8-3841aee50b69.jsonl";
         assert_eq!(
@@ -450,9 +472,10 @@ mod tests {
         .unwrap();
         drop(f);
 
-        let (project, title, _display) = parse_codex_metadata(&file_path, &index_map);
+        let (project, title, display) = parse_codex_metadata(&file_path, &index_map);
         assert_eq!(project, "my-cool-project");
         assert_eq!(title, Some("My Indexed Thread".to_string()));
+        assert_eq!(display, "2026-02-27 10:47:59 (019542a1)");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -478,10 +501,10 @@ mod tests {
                 title: None,
                 display_title: "o1".to_string(),
                 path: PathBuf::from("/tmp/o1.jsonl"),
-                logical_size: 100,
-                physical_size: 10,
+                logical_size: 200,
+                physical_size: 20,
                 compressed: false,
-                modified_at: now - Duration::from_secs(500),
+                modified_at: now - Duration::from_secs(100),
             },
             SessionFile {
                 tool: Tool::Codex,
@@ -489,10 +512,10 @@ mod tests {
                 title: None,
                 display_title: "n1".to_string(),
                 path: PathBuf::from("/tmp/n1.jsonl"),
-                logical_size: 100,
-                physical_size: 10,
+                logical_size: 300,
+                physical_size: 30,
                 compressed: false,
-                modified_at: now - Duration::from_secs(10),
+                modified_at: now + Duration::from_secs(100),
             },
         ];
 
@@ -501,7 +524,7 @@ mod tests {
         assert_eq!(groups[0].tool, Tool::Codex);
         assert_eq!(groups[1].tool, Tool::Claude);
 
-        // Under Codex, newer-proj should come before older-proj
+        // Under Codex, newer-proj should come first
         assert_eq!(groups[0].projects[0].name, "newer-proj");
         assert_eq!(groups[0].projects[1].name, "older-proj");
     }
